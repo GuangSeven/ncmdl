@@ -1,6 +1,6 @@
 # ncmdl
 
-网易云音乐终端版下载脚本。
+网易云音乐终端版下载脚本。（原脚本：[![Greasy Fork](https://img.shields.io/badge/Greasy_Fork-网易云音乐歌曲下载-8a0000?logo=greasyfork&logoColor=white&style=flat)](https://greasyfork.org/scripts/459633)）
 
 ## 目标
 
