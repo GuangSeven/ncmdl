@@ -20,12 +20,14 @@ const {
   parseSongId,
   resolveDownloadUrl
 } = require("./netease");
+const { autoCaptureCookie } = require("./cookie");
 
 function printHelp() {
   stdout.write(`ncmdl - 网易云音乐终端版下载脚本
 
 用法:
   node src/cli.js setup
+  node src/cli.js cookie          ← 自动打开浏览器抓取 Cookie
   node src/cli.js download <歌曲ID或链接>
   node src/cli.js config show
 
@@ -189,6 +191,25 @@ async function main() {
     out: parsed.values.out || process.env.NCM_DOWNLOAD_DIR || "",
     pattern: parsed.values.pattern || process.env.NCM_FILENAME_PATTERN || ""
   });
+
+  if (command === "cookie") {
+    stdout.write("自动抓取 Cookie — 将打开浏览器窗口，请在页面中登录网易云音乐。\n");
+    stdout.write("登录完成后脚本会自动提取 Cookie 并保存到本地配置。\n\n");
+    try {
+      const cookieStr = await autoCaptureCookie({ headless: false });
+      if (!cookieStr) {
+        throw new Error("未能获取到 Cookie，请重试。");
+      }
+      config.cookie = cookieStr;
+      await saveConfig(config);
+      stdout.write("\nCookie 已保存到本地配置。\n");
+      stdout.write(`Cookie: ${maskSecret(cookieStr)}\n`);
+    } catch (err) {
+      console.error(`抓取 Cookie 失败: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
 
   if (command === "setup") {
     await setupWizard(config);
