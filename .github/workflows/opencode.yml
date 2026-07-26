@@ -22,10 +22,10 @@ jobs:
            persist-credentials: false
 
        - name: Run OpenCode
-        uses: anomalyco/opencode/github@latest
-        env:
-          API_KEY: ${{ secrets.API_KEY }}
-        with:
-          model: opencode/deepseek-v4-flash-free
-          share: true
-          # github_token: xxxx
+         uses: anomalyco/opencode/github@latest
+         env:
+           API_KEY: ${{ secrets.API_KEY }}
+         with:
+           model: opencode/deepseek-v4-flash-free
+           share: true
+           # github_token: xxxx
