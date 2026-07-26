@@ -13,7 +13,7 @@ jobs:
       contains(github.event.comment.body, '/opencode')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       issues: write
       pull-requests: write
       id-token: write
@@ -30,4 +30,6 @@ jobs:
            API_KEY: ${{ secrets.API_KEY }}
          with:
            model: opencode/deepseek-v4-flash-free
-           github_token: ${{ secrets.GITHUB_TOKEN }}
+           github_token: ${{ secrets.USE_GITHUB_TOKEN }}
+           variant: max
+           share: true
