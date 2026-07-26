@@ -30,6 +30,6 @@ jobs:
            API_KEY: ${{ secrets.API_KEY }}
          with:
            model: opencode/deepseek-v4-flash-free
-           use_github_token: ${{ secrets.GITHUB_TOKEN }}
+           use_github_token: true
            variant: max
            share: true
