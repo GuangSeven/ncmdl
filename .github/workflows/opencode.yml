@@ -13,6 +13,9 @@ jobs:
       contains(github.event.comment.body, '/opencode')
     runs-on: ubuntu-latest
     permissions:
+      contents: read
+      issues: write
+      pull-requests: write
       id-token: write
     steps:
        - name: Checkout repository
@@ -27,5 +30,4 @@ jobs:
            API_KEY: ${{ secrets.API_KEY }}
          with:
            model: opencode/deepseek-v4-flash-free
-           share: true
-           # github_token: xxxx
+           github_token: ${{ secrets.GITHUB_TOKEN }}
