@@ -22,7 +22,7 @@ jobs:
          uses: actions/checkout@v6
          with:
            fetch-depth: 1
-           persist-credentials: false
+           persist-credentials: true
 
        - name: Run OpenCode
          uses: anomalyco/opencode/github@latest
@@ -30,6 +30,6 @@ jobs:
            API_KEY: ${{ secrets.API_KEY }}
          with:
            model: opencode/deepseek-v4-flash-free
-           github_token: ${{ secrets.USE_GITHUB_TOKEN }}
+           use_github_token: ${{ secrets.GITHUB_TOKEN }}
            variant: max
            share: true
