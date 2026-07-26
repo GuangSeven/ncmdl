@@ -9,8 +9,10 @@ on:
 jobs:
   opencode:
     if: |
-      contains(github.event.comment.body, '/oc') ||
-      contains(github.event.comment.body, '/opencode')
+      contains(github.event.comment.body, ' /oc') ||
+      startsWith(github.event.comment.body, '/oc') ||
+      contains(github.event.comment.body, ' /opencode') ||
+      startsWith(github.event.comment.body, '/opencode')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -18,18 +20,18 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
-       - name: Checkout repository
-         uses: actions/checkout@v6
-         with:
-           fetch-depth: 1
-           persist-credentials: true
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: true
 
-       - name: Run OpenCode
-         uses: anomalyco/opencode/github@latest
-         env:
-           API_KEY: ${{ secrets.API_KEY }}
-         with:
-           model: opencode/deepseek-v4-flash-free
-           use_github_token: true
-           variant: max
-           share: true
+      - name: Run opencode
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        with:
+          model: opencode/deepseek-v4-flash-free
+          use_github_token: true
+          variant: max
+          share: true
