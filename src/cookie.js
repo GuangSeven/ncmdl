@@ -210,11 +210,17 @@ async function autoCaptureCookie(options = {}) {
   // 先检查端口是否已被占用（可能已有浏览器调试实例在运行）
   const existingPort = await checkPortInUse(port);
   let browserProcess = null;
+  // 每次运行生成唯一临时目录，避免并发运行时 SingletonLock 冲突，也避免脏数据残留。
+  let userDataDir = null;
 
   if (!existingPort) {
     // 启动浏览器，开启调试端口
+    // 必须使用独立的 user-data-dir，否则系统里已有 Edge/Chrome 实例时，
+    // 新进程会把 URL 转交给旧实例后立即退出，导致调试端口无效、进程退出报错。
+    userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-cdp-"));
     const args = [
       `--remote-debugging-port=${port}`,
+      `--user-data-dir=${userDataDir}`,
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-sync",
@@ -252,6 +258,10 @@ async function autoCaptureCookie(options = {}) {
       ]);
     }
     // 如果是复用的已有实例，不关闭它。
+    // 清理本次创建的临时 user-data-dir，避免缓存残留。
+    if (userDataDir) {
+      fs.rmSync(userDataDir, { force: true, recursive: true });
+    }
   }
 }
 
@@ -263,7 +273,9 @@ async function waitForCdpReady(port, browserProcess, timeoutMs = 15000) {
   let lastError;
   while (Date.now() < deadline) {
     if (browserProcess?.exitCode !== null) {
-      throw new Error("浏览器启动失败，请检查是否有其他实例已在运行。");
+      throw new Error(
+        `浏览器进程已退出（exit code ${browserProcess?.exitCode}），可能是启动失败或存在实例冲突，请检查后重试。`
+      );
     }
     try {
       const debuggerUrl = await getWebSocketDebuggerUrl(port);
@@ -273,7 +285,9 @@ async function waitForCdpReady(port, browserProcess, timeoutMs = 15000) {
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  throw new Error(`等待浏览器调试端口就绪超时${lastError ? `: ${lastError.message}` : ""}`);
+  throw new Error(
+    `等待浏览器调试端口就绪超时${lastError ? `: ${lastError.message}` : ""}，可能已有实例占用了端口。`
+  );
 }
 
 /**
