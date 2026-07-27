@@ -91,14 +91,17 @@ function getWebSocketDebuggerUrl(port) {
 }
 
 /**
- * 通过浏览器级 CDP WebSocket 获取所有 Cookie（包括 HttpOnly Cookie）。
+ * 通过页面级 CDP WebSocket 获取所有 Cookie（包括 HttpOnly Cookie）。
+ * Storage.getCookies 是 page/target-level 方法，必须连接页面 target 的 WS，
+ * 而非 /json/version 返回的 browser-level WS（后者不支持该方法）。
  */
 async function getCookiesViaCdp(port, timeoutMs = 5000) {
-  const debuggerUrl = await getWebSocketDebuggerUrl(port);
-  if (!debuggerUrl) throw new Error("CDP 未返回 WebSocket 调试地址");
+  const pages = await getPages(port);
+  const page = pages.find((p) => p.type === "page" && p.webSocketDebuggerUrl);
+  if (!page) throw new Error("CDP 未找到可用的页面 target，请确认浏览器已打开页面");
 
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(debuggerUrl);
+    const socket = new WebSocket(page.webSocketDebuggerUrl);
     const timer = setTimeout(() => finish(new Error("CDP Cookie 请求超时")), timeoutMs);
     let finished = false;
 
@@ -153,6 +156,7 @@ function getPages(port) {
 async function waitForLogin(port, timeoutMs = 180000) {
   const startTime = Date.now();
   const pollInterval = 2000;
+  let lastError;
 
   while (Date.now() - startTime < timeoutMs) {
     await new Promise((r) => setTimeout(r, pollInterval));
@@ -172,12 +176,15 @@ async function waitForLogin(port, timeoutMs = 180000) {
           .join("; ");
         return cookieStr;
       }
-    } catch {
-      // 轮询时可能 CDP 临时不可用，忽略
+    } catch (error) {
+      // 轮询时 CDP 可能临时不可用，记录最后一次错误用于超时诊断
+      lastError = error;
     }
   }
 
-  throw new Error("等待登录超时（3 分钟），请重试。");
+  throw new Error(
+    `等待登录超时（3 分钟），请重试。${lastError ? ` 最后一次错误: ${lastError.message}` : ""}`
+  );
 }
 
 /**
@@ -261,11 +268,20 @@ async function autoCaptureCookie(options = {}) {
 async function cleanupSession(browserProcess, userDataDir) {
   if (browserProcess && browserProcess.exitCode === null && !browserProcess.killed) {
     const exited = new Promise((resolve) => browserProcess.once("exit", resolve));
-    browserProcess.kill();
-    await Promise.race([
-      exited,
-      new Promise((resolve) => setTimeout(resolve, 3000)),
+    browserProcess.kill("SIGTERM");
+    const didExit = await Promise.race([
+      exited.then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
     ]);
+    // SIGTERM 后进程仍存活（如 crash reporter 弹窗），用 SIGKILL 强制终止，
+    // 避免孤儿进程持有文件锁导致临时目录无法删除（Windows 常见）。
+    if (!didExit && browserProcess.exitCode === null) {
+      browserProcess.kill("SIGKILL");
+      await Promise.race([
+        exited,
+        new Promise((resolve) => setTimeout(resolve, 2000)),
+      ]);
+    }
   }
   if (userDataDir) {
     try {
