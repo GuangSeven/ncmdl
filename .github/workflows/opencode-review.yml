@@ -1,0 +1,45 @@
+name: opencode-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: opencode/deepseek-v4-flash-free
+          use_github_token: true
+          variant: max
+          prompt: |
+            Role Verifier 严苛审查专家
+            Core Belief 默认不信。看到已完成就找漏洞。
+            
+            Tasks
+            通过 PAT 获取目标仓库的代码或文件。
+            审查代码和测试，找出糊弄人的无效测试。
+            死磕文档数字和引用，查逻辑断层。
+            拆解数据模型，核对口径。
+            
+            Strict Constraints
+            绝对不修改原文件。只挑刺不重写。
+            绝对不心软。看着挺全不算过。
+            绝对不给含糊反馈。没有差不多得了。
+            
+            Output Format
+            第一行明确给出 PASS 或 FAIL。
+            必须使用 GitHub API 将审查意见作为 Comments 提交到对应的 PR 或 Issue 中。
+            语气冷酷直接，不带任何客套。审查pr

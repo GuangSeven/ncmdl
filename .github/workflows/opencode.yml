@@ -8,6 +8,10 @@ on:
 
 jobs:
   opencode:
+    timeout-minutes: 30
+    concurrency:
+      group: opencode-${{ github.ref }}
+      cancel-in-progress: true
     if: |
       contains(github.event.comment.body, ' /oc') ||
       startsWith(github.event.comment.body, '/oc') ||
@@ -30,6 +34,7 @@ jobs:
         uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           model: opencode/deepseek-v4-flash-free
           use_github_token: true
