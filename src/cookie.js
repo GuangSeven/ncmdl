@@ -7,12 +7,12 @@
  */
 
 const http = require("node:http");
-const { spawn } = require("node:child_process");
-const { once } = require("node:events");
-const { readFile, unlink } = require("node:fs/promises");
+const { execFileSync, spawn } = require("node:child_process");
 const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
+const net = require("node:net");
+const WebSocket = require("ws");
 
 const DEFAULT_CDP_PORT = 9222;
 const MUSIC_163_URL = "https://music.163.com";
@@ -21,41 +21,52 @@ const MUSIC_163_URL = "https://music.163.com";
  * 找到系统里可用的 Edge / Chrome / Chromium 可执行文件路径
  */
 function findBrowserExecutable() {
-  // Windows 上 Edge 的常见安装路径
-  const candidates = [
-    // Edge (稳定版)
-    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-    // Chrome
-    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-    // 用户目录下的 Edge (系统级安装)
-    path.join(os.homedir(), "AppData", "Local", "Microsoft", "Edge", "Application", "msedge.exe"),
-    // Chromium (用户手动安装)
-    path.join(os.homedir(), "AppData", "Local", "Chromium", "Application", "chrome.exe"),
-  ];
+  const home = os.homedir();
+  const candidatesByPlatform = {
+    win32: [
+      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      path.join(home, "AppData", "Local", "Microsoft", "Edge", "Application", "msedge.exe"),
+      path.join(home, "AppData", "Local", "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(home, "AppData", "Local", "Chromium", "Application", "chrome.exe"),
+    ],
+    darwin: [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      path.join(home, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
+    ],
+    linux: [
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/microsoft-edge",
+      "/usr/bin/microsoft-edge-stable",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/snap/bin/chromium",
+    ],
+  };
 
-  for (const exe of candidates) {
+  for (const executable of candidatesByPlatform[process.platform] || []) {
     try {
-      fs.accessSync(exe, fs.constants.X_OK);
-      return exe;
-    } catch {
-      continue;
-    }
+      fs.accessSync(executable, fs.constants.X_OK);
+      return executable;
+    } catch {}
   }
 
-  // 最后尝试从 PATH 里找
-  const names = ["msedge", "chrome", "chromium", "edge"];
+  const command = process.platform === "win32" ? "where" : "which";
+  const names = process.platform === "win32"
+    ? ["msedge", "chrome", "chromium"]
+    : ["google-chrome", "google-chrome-stable", "microsoft-edge", "chromium", "chromium-browser"];
   for (const name of names) {
     try {
-      const which = require("child_process").execSync(`where ${name}`, { encoding: "utf8", stdio: "pipe" });
-      const exe = which.split("\n")[0].trim();
-      if (exe) return exe;
-    } catch {
-      continue;
-    }
+      const output = execFileSync(command, [name], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      const executable = output.split(/\r?\n/).find(Boolean)?.trim();
+      if (executable) return executable;
+    } catch {}
   }
-
   return null;
 }
 
@@ -80,90 +91,40 @@ function getWebSocketDebuggerUrl(port) {
 }
 
 /**
- * 通过 CDP HTTP 接口获取当前所有页面的 Cookie
- * Returns: { name: string, value: string }[]
+ * 通过浏览器级 CDP WebSocket 获取所有 Cookie（包括 HttpOnly Cookie）。
  */
-function getCookiesViaCdp(port) {
+async function getCookiesViaCdp(port, timeoutMs = 5000) {
+  const debuggerUrl = await getWebSocketDebuggerUrl(port);
+  if (!debuggerUrl) throw new Error("CDP 未返回 WebSocket 调试地址");
+
   return new Promise((resolve, reject) => {
-    const postData = JSON.stringify({
-      method: "Network.getAllCookies",
-      id: 1,
+    const socket = new WebSocket(debuggerUrl);
+    const timer = setTimeout(() => finish(new Error("CDP Cookie 请求超时")), timeoutMs);
+    let finished = false;
+
+    function finish(error, cookies) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      socket.close();
+      if (error) reject(error);
+      else resolve(cookies);
+    }
+
+    socket.once("open", () => {
+      socket.send(JSON.stringify({ id: 1, method: "Storage.getCookies" }));
     });
-
-    const options = {
-      hostname: "127.0.0.1",
-      port,
-      path: "/json/cdp",
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(postData),
-      },
-    };
-
-    const req = http.request(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
-        try {
-          const json = JSON.parse(data);
-          // CDP POST /json/cdp 返回的结果可能包在 result 里
-          const cookies = json.result?.cookies || json.cookies || [];
-          resolve(cookies);
-        } catch (e) {
-          reject(new Error(`解析 CDP cookie 响应失败: ${e.message}`));
-        }
-      });
+    socket.on("message", (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        if (message.id !== 1) return;
+        if (message.error) throw new Error(message.error.message || "CDP 命令失败");
+        finish(null, message.result?.cookies || []);
+      } catch (error) {
+        finish(error);
+      }
     });
-
-    req.on("error", reject);
-    req.write(postData);
-    req.end();
-  });
-}
-
-/**
- * 通过 CDP 执行 JavaScript 来获取所有 Cookie（备用方案）
- * 某些情况下 POST /json/cdp 不可用，可以用这种方法
- */
-function getCookiesViaJS(port, pageId) {
-  return new Promise((resolve, reject) => {
-    const postData = JSON.stringify({
-      method: "Runtime.evaluate",
-      id: 1,
-      params: {
-        expression: "document.cookie",
-      },
-    });
-
-    const options = {
-      hostname: "127.0.0.1",
-      port,
-      path: `/json/cdp/${pageId}`,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(postData),
-      },
-    };
-
-    const req = http.request(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
-        try {
-          const json = JSON.parse(data);
-          const cookieStr = json.result?.result?.value || "";
-          resolve(cookieStr);
-        } catch (e) {
-          reject(new Error(`CDP Runtime.evaluate 失败: ${e.message}`));
-        }
-      });
-    });
-
-    req.on("error", reject);
-    req.write(postData);
-    req.end();
+    socket.once("error", finish);
   });
 }
 
@@ -270,13 +231,7 @@ async function autoCaptureCookie(options = {}) {
       detached: false,
     });
 
-    // 等浏览器启动
-    await new Promise((r) => setTimeout(r, 3000));
-
-    // 检查进程是否还活着
-    if (browserProcess.exitCode !== null) {
-      throw new Error("浏览器启动失败，请检查是否有其他实例已在运行。");
-    }
+    await waitForCdpReady(port, browserProcess, Math.min(timeout, 15000));
   } else {
     console.log("检测到已有浏览器调试实例，复用中...");
   }
@@ -287,14 +242,38 @@ async function autoCaptureCookie(options = {}) {
 
     return cookieStr;
   } finally {
-    // 关闭浏览器（只关我们自己启动的）
-    if (browserProcess && !browserProcess.killed) {
+    // 关闭浏览器（只关我们自己启动的），并防止进程已退出时错过 exit 事件。
+    if (browserProcess && browserProcess.exitCode === null && !browserProcess.killed) {
+      const exited = new Promise((resolve) => browserProcess.once("exit", resolve));
       browserProcess.kill();
-      // 等进程退出
-      await once(browserProcess, "exit").catch(() => {});
+      await Promise.race([
+        exited,
+        new Promise((resolve) => setTimeout(resolve, 3000)),
+      ]);
     }
-    // 注意：如果是复用的已有实例，我们不关它
+    // 如果是复用的已有实例，不关闭它。
   }
+}
+
+/**
+ * 等待 CDP HTTP 服务真正可用，而不是依赖固定延时。
+ */
+async function waitForCdpReady(port, browserProcess, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    if (browserProcess?.exitCode !== null) {
+      throw new Error("浏览器启动失败，请检查是否有其他实例已在运行。");
+    }
+    try {
+      const debuggerUrl = await getWebSocketDebuggerUrl(port);
+      if (debuggerUrl) return debuggerUrl;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error(`等待浏览器调试端口就绪超时${lastError ? `: ${lastError.message}` : ""}`);
 }
 
 /**
@@ -302,7 +281,7 @@ async function autoCaptureCookie(options = {}) {
  */
 function checkPortInUse(port) {
   return new Promise((resolve) => {
-    const server = require("net").createServer();
+    const server = net.createServer();
     server.once("error", () => resolve(true));
     server.once("listening", () => {
       server.close();
@@ -314,8 +293,11 @@ function checkPortInUse(port) {
 
 module.exports = {
   autoCaptureCookie,
+  checkPortInUse,
   findBrowserExecutable,
   getCookiesViaCdp,
   getPages,
+  getWebSocketDebuggerUrl,
+  waitForCdpReady,
   waitForLogin,
 };
