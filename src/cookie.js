@@ -190,9 +190,9 @@ async function waitForLogin(port, timeoutMs = 180000) {
  * @returns {Promise<string>} cookie 字符串
  */
 async function autoCaptureCookie(options = {}) {
-  const port = options.port || DEFAULT_CDP_PORT;
-  const headless = options.headless || false;
-  const timeout = options.timeout || 180000;
+  const port = options.port ?? DEFAULT_CDP_PORT;
+  const headless = options.headless ?? false;
+  const timeout = options.timeout ?? 180000;
 
   const browserPath = findBrowserExecutable();
   if (!browserPath) {
@@ -248,19 +248,30 @@ async function autoCaptureCookie(options = {}) {
 
     return cookieStr;
   } finally {
-    // 关闭浏览器（只关我们自己启动的），并防止进程已退出时错过 exit 事件。
-    if (browserProcess && browserProcess.exitCode === null && !browserProcess.killed) {
-      const exited = new Promise((resolve) => browserProcess.once("exit", resolve));
-      browserProcess.kill();
-      await Promise.race([
-        exited,
-        new Promise((resolve) => setTimeout(resolve, 3000)),
-      ]);
-    }
-    // 如果是复用的已有实例，不关闭它。
-    // 清理本次创建的临时 user-data-dir，避免缓存残留。
-    if (userDataDir) {
+    // 如果是复用的已有实例，browserProcess/userDataDir 均为 null，cleanupSession 会跳过。
+    // 清理用 try/catch 包裹，避免吞掉 try 块里 waitForLogin 抛出的原始错误。
+    await cleanupSession(browserProcess, userDataDir);
+  }
+}
+
+/**
+ * 关闭本次启动的浏览器进程并清理临时 user-data-dir。
+ * 清理失败不会抛出，以免替换 try 块中的原始错误（如登录超时）。
+ */
+async function cleanupSession(browserProcess, userDataDir) {
+  if (browserProcess && browserProcess.exitCode === null && !browserProcess.killed) {
+    const exited = new Promise((resolve) => browserProcess.once("exit", resolve));
+    browserProcess.kill();
+    await Promise.race([
+      exited,
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
+  }
+  if (userDataDir) {
+    try {
       fs.rmSync(userDataDir, { force: true, recursive: true });
+    } catch {
+      // 清理失败不应影响原始错误传播
     }
   }
 }
@@ -308,6 +319,7 @@ function checkPortInUse(port) {
 module.exports = {
   autoCaptureCookie,
   checkPortInUse,
+  cleanupSession,
   findBrowserExecutable,
   getCookiesViaCdp,
   getPages,
