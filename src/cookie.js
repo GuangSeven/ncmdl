@@ -211,7 +211,18 @@ async function autoCaptureCookie(options = {}) {
   const headless = options.headless ?? false;
   const timeout = options.timeout ?? 180000;
 
-  const browserPath = findBrowserExecutable();
+  // 依赖注入点：仅供测试替换底层实现，正常调用无需传入。
+  const deps = options.deps ?? {};
+  const findBrowser = deps.findBrowserExecutable ?? findBrowserExecutable;
+  const checkPort = deps.checkPortInUse ?? checkPortInUse;
+  const spawnBrowser = deps.spawn ?? spawn;
+  const waitReady = deps.waitForCdpReady ?? waitForCdpReady;
+  const waitLogin = deps.waitForLogin ?? waitForLogin;
+  const cleanup = deps.cleanupSession ?? cleanupSession;
+  const makeTempDir =
+    deps.makeTempDir ?? (() => fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-cdp-")));
+
+  const browserPath = findBrowser();
   if (!browserPath) {
     throw new Error(
       "未找到 Edge/Chrome 浏览器。如果你已安装，请手动复制 Cookie 后运行 `node src/cli.js config show` 确认。"
@@ -225,7 +236,7 @@ async function autoCaptureCookie(options = {}) {
   }
 
   // 先检查端口是否已被占用（可能已有浏览器调试实例在运行）
-  const existingPort = await checkPortInUse(port);
+  const existingPort = await checkPort(port);
   let browserProcess = null;
   // 每次运行生成唯一临时目录，避免并发运行时 SingletonLock 冲突，也避免脏数据残留。
   let userDataDir = null;
@@ -234,7 +245,7 @@ async function autoCaptureCookie(options = {}) {
     // 启动浏览器，开启调试端口
     // 必须使用独立的 user-data-dir，否则系统里已有 Edge/Chrome 实例时，
     // 新进程会把 URL 转交给旧实例后立即退出，导致调试端口无效、进程退出报错。
-    userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-cdp-"));
+    userDataDir = makeTempDir();
     const args = [
       `--remote-debugging-port=${port}`,
       `--user-data-dir=${userDataDir}`,
@@ -249,25 +260,31 @@ async function autoCaptureCookie(options = {}) {
       args.push("--headless=new");
     }
 
-    browserProcess = spawn(browserPath, args, {
+    browserProcess = spawnBrowser(browserPath, args, {
       stdio: "ignore",
       detached: false,
     });
+    // spawn 可能异步失败（ENOENT/EACCES 等），必须挂 error 监听，否则变成未捕获异常；
+    // 同时把错误传给 waitForCdpReady，以便快速报出"启动失败/端口被占用"而非干等超时。
+    let spawnError = null;
+    browserProcess.on("error", (err) => {
+      spawnError = err;
+    });
 
-    await waitForCdpReady(port, browserProcess, Math.min(timeout, 15000));
+    await waitReady(port, browserProcess, Math.min(timeout, 15000), () => spawnError);
   } else {
     console.log("检测到已有浏览器调试实例，复用中...");
   }
 
   try {
     // 等待用户登录并获取 Cookie
-    const cookieStr = await waitForLogin(port, timeout);
+    const cookieStr = await waitLogin(port, timeout);
 
     return cookieStr;
   } finally {
     // 如果是复用的已有实例，browserProcess/userDataDir 均为 null，cleanupSession 会跳过。
     // 清理用 try/catch 包裹，避免吞掉 try 块里 waitForLogin 抛出的原始错误。
-    await cleanupSession(browserProcess, userDataDir);
+    await cleanup(browserProcess, userDataDir);
   }
 }
 
@@ -314,14 +331,27 @@ async function cleanupSession(browserProcess, userDataDir) {
 
 /**
  * 等待 CDP HTTP 服务真正可用，而不是依赖固定延时。
+ *
+ * @param {number} port
+ * @param {object|null} browserProcess   浏览器子进程（复用已有实例时为 null）
+ * @param {number} [timeoutMs]
+ * @param {() => (Error|null)} [getSpawnError]  返回异步 spawn 错误的取值器（可选）
  */
-async function waitForCdpReady(port, browserProcess, timeoutMs = 15000) {
+async function waitForCdpReady(port, browserProcess, timeoutMs = 15000, getSpawnError = null) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
-    if (browserProcess?.exitCode !== null) {
+    const spawnError = getSpawnError?.();
+    if (spawnError) {
       throw new Error(
-        `浏览器进程已退出（exit code ${browserProcess?.exitCode}），可能是启动失败或存在实例冲突，请检查后重试。`
+        `浏览器启动失败: ${spawnError.message}（可能是浏览器路径无效或调试端口被占用）`
+      );
+    }
+    // 用 != null 同时排除 null 与 undefined：browserProcess 为 null（复用实例）
+    // 或进程尚未退出时都不应误报 "exit code undefined"。
+    if (browserProcess && browserProcess.exitCode != null) {
+      throw new Error(
+        `浏览器进程已退出（exit code ${browserProcess.exitCode}），可能是启动失败或存在实例冲突，请检查后重试。`
       );
     }
     try {
@@ -332,8 +362,15 @@ async function waitForCdpReady(port, browserProcess, timeoutMs = 15000) {
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
+  // 超时后再确认一次端口状态，区分"端口被其他实例占用"（TOCTOU：检查后被抢）
+  // 与"单纯启动慢"，给出更明确的错误。
+  if (await checkPortInUse(port)) {
+    throw new Error(
+      `浏览器调试端口 ${port} 已被其他实例占用，无法建立 CDP 连接。请关闭占用该端口的浏览器实例后重试。`
+    );
+  }
   throw new Error(
-    `等待浏览器调试端口就绪超时${lastError ? `: ${lastError.message}` : ""}，可能已有实例占用了端口。`
+    `等待浏览器调试端口就绪超时${lastError ? `: ${lastError.message}` : ""}。`
   );
 }
 

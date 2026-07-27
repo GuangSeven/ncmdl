@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
@@ -8,6 +9,7 @@ const test = require("node:test");
 const WebSocket = require("ws");
 
 const {
+  autoCaptureCookie,
   checkPortInUse,
   cleanupSession,
   findBrowserExecutable,
@@ -282,4 +284,162 @@ test("getPages rejects when the server accepts but never responds", async () => 
   } finally {
     server.close();
   }
+});
+
+test("waitForCdpReady does not treat a null browserProcess as exited", async () => {
+  // browserProcess 为 null（复用实例）时应走超时路径，而非误报 "exit code undefined"
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const freePort = server.address().port;
+  await new Promise((resolve) => server.close(resolve));
+  await assert.rejects(waitForCdpReady(freePort, null, 500), /超时/);
+});
+
+test("waitForCdpReady throws when spawn fails asynchronously", async () => {
+  const fakeProcess = { exitCode: null, killed: false };
+  await assert.rejects(
+    waitForCdpReady(9, fakeProcess, 1000, () => new Error("spawn ENOENT")),
+    /浏览器启动失败.*ENOENT/
+  );
+});
+
+test("autoCaptureCookie throws when no browser executable is found", async () => {
+  await assert.rejects(
+    autoCaptureCookie({ deps: { findBrowserExecutable: () => null } }),
+    /未找到 Edge\/Chrome 浏览器/
+  );
+});
+
+test("autoCaptureCookie reuses an existing debug instance without spawning", async () => {
+  let spawnCalled = false;
+  let cleanupArgs = null;
+  const cookieStr = await autoCaptureCookie({
+    deps: {
+      findBrowserExecutable: () => "/fake/browser",
+      checkPortInUse: async () => true, // 端口已被占用 → 复用
+      spawn: () => {
+        spawnCalled = true;
+        return {};
+      },
+      waitForLogin: async () => "MUSIC_U=test-token",
+      cleanupSession: async (proc, dir) => {
+        cleanupArgs = { proc, dir };
+      },
+    },
+  });
+  assert.equal(cookieStr, "MUSIC_U=test-token");
+  assert.equal(spawnCalled, false);
+  assert.deepEqual(cleanupArgs, { proc: null, dir: null });
+});
+
+test("autoCaptureCookie spawns a browser with an isolated profile and cleans up", async () => {
+  let spawnArgs = null;
+  let readyCalled = false;
+  let cleanupArgs = null;
+  const fakeProcess = {
+    exitCode: null,
+    killed: false,
+    on() {
+      return this;
+    },
+    once() {
+      return this;
+    },
+    kill() {
+      return true;
+    },
+  };
+  const cookieStr = await autoCaptureCookie({
+    deps: {
+      findBrowserExecutable: () => "/fake/browser",
+      checkPortInUse: async () => false, // 端口空闲 → 启动新实例
+      makeTempDir: () => "/fake/temp/dir",
+      spawn: (exePath, args) => {
+        spawnArgs = { exePath, args };
+        return fakeProcess;
+      },
+      waitForCdpReady: async () => {
+        readyCalled = true;
+        return "ws://fake";
+      },
+      waitForLogin: async () => "MUSIC_U=test-token",
+      cleanupSession: async (proc, dir) => {
+        cleanupArgs = { proc, dir };
+      },
+    },
+  });
+  assert.equal(cookieStr, "MUSIC_U=test-token");
+  assert.equal(spawnArgs.exePath, "/fake/browser");
+  assert.ok(spawnArgs.args.includes("--user-data-dir=/fake/temp/dir"));
+  assert.ok(spawnArgs.args.some((a) => a.startsWith("--remote-debugging-port=")));
+  assert.equal(readyCalled, true);
+  assert.deepEqual(cleanupArgs, { proc: fakeProcess, dir: "/fake/temp/dir" });
+});
+
+test("autoCaptureCookie cleans up even when login fails", async () => {
+  let cleanupCalled = false;
+  const fakeProcess = {
+    exitCode: null,
+    killed: false,
+    on() {
+      return this;
+    },
+    once() {
+      return this;
+    },
+    kill() {
+      return true;
+    },
+  };
+  await assert.rejects(
+    autoCaptureCookie({
+      deps: {
+        findBrowserExecutable: () => "/fake/browser",
+        checkPortInUse: async () => false,
+        makeTempDir: () => "/fake/temp/dir",
+        spawn: () => fakeProcess,
+        waitForCdpReady: async () => "ws://fake",
+        waitForLogin: async () => {
+          throw new Error("登录超时");
+        },
+        cleanupSession: async () => {
+          cleanupCalled = true;
+        },
+      },
+    }),
+    /登录超时/
+  );
+  assert.equal(cleanupCalled, true);
+});
+
+test("autoCaptureCookie surfaces async spawn errors via waitForCdpReady", async () => {
+  // 取一个空闲端口，避免 getWebSocketDebuggerUrl 意外成功
+  const probe = net.createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const freePort = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const fakeProcess = new EventEmitter();
+  fakeProcess.exitCode = null;
+  fakeProcess.killed = false;
+  fakeProcess.kill = () => true;
+
+  await assert.rejects(
+    autoCaptureCookie({
+      port: freePort,
+      deps: {
+        findBrowserExecutable: () => "/fake/browser",
+        checkPortInUse: async () => false,
+        makeTempDir: () => "/fake/temp/dir",
+        spawn: () => {
+          process.nextTick(() => fakeProcess.emit("error", new Error("spawn ENOENT")));
+          return fakeProcess;
+        },
+        // 不注入 waitForCdpReady，走真实逻辑以验证 spawn error 接线
+        waitForLogin: async () => "x",
+        cleanupSession: async () => {},
+      },
+    }),
+    /浏览器启动失败.*ENOENT/
+  );
 });
