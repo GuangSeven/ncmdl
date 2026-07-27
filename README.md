@@ -21,14 +21,18 @@
 - `downloadDir`：下载目录。
 - `quality`：默认音质，例如 `jymaster`、`lossless`、`exhigh`、`standard`。
 
-如果你不想手工写配置，也可以直接运行 `setup` 命令，按提示输入。
+获取 Cookie 有两种方式：
+
+1. **自动抓取（推荐）**：运行 `node src/cli.js cookie`，脚本会自动打开系统 Edge/Chrome 浏览器并跳转到网易云音乐，你登录后脚本自动提取 Cookie 并保存到本地配置。
+2. **手动输入**：运行 `node src/cli.js setup`，按提示粘贴从浏览器开发者工具中复制的 Cookie。
 
 ## 使用
 
 先安装 Node.js 18 或更高版本，然后在仓库根目录执行：
 
 ```bash
-node src/cli.js setup
+node src/cli.js setup               # 手动输入配置
+node src/cli.js cookie              # 自动打开浏览器抓取 Cookie（推荐）
 node src/cli.js download 123456
 node src/cli.js download https://music.163.com/song?id=123456
 node src/cli.js config show
