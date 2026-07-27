@@ -12,6 +12,7 @@ const {
   cleanupSession,
   findBrowserExecutable,
   getCookiesViaCdp,
+  getPages,
   waitForCdpReady,
   waitForLogin,
 } = require("../src/cookie");
@@ -203,5 +204,82 @@ test("waitForLogin includes last error in timeout message", async () => {
     );
   } finally {
     httpServer.close();
+  }
+});
+
+/**
+ * 模拟一个 ChildProcess：kill(SIGTERM/SIGKILL) 时按配置触发或不触发 exit 事件。
+ */
+function createFakeProcess({ ignoreSigterm = false } = {}) {
+  let exitListener = null;
+  let currentExitCode = null;
+  let killedFlag = false;
+  return {
+    get exitCode() {
+      return currentExitCode;
+    },
+    get killed() {
+      return killedFlag;
+    },
+    once(event, cb) {
+      if (event === "exit") exitListener = cb;
+      return this;
+    },
+    kill(signal) {
+      killedFlag = true;
+      if (signal === "SIGKILL" || !ignoreSigterm) {
+        currentExitCode = 0;
+        if (exitListener) exitListener();
+      }
+      return true;
+    },
+  };
+}
+
+test("cleanupSession terminates a running process via SIGTERM", async () => {
+  const fake = createFakeProcess({ ignoreSigterm: false });
+  const start = Date.now();
+  await cleanupSession(fake, null);
+  assert.ok(Date.now() - start < 1000, "SIGTERM graceful exit should be fast");
+  assert.equal(fake.killed, true);
+  assert.equal(fake.exitCode, 0);
+});
+
+test("cleanupSession falls back to SIGKILL when SIGTERM is ignored", async () => {
+  const fake = createFakeProcess({ ignoreSigterm: true });
+  const start = Date.now();
+  await cleanupSession(fake, null);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed >= 3000, `Should wait ~3s before SIGKILL, took ${elapsed}ms`);
+  assert.equal(fake.exitCode, 0);
+});
+
+test("cleanupSession resolves immediately for an already-exited process", async () => {
+  // exitCode 已非 null 且 exit 事件不会重放：验证手动 resolve 路径，不会卡 3s 超时
+  const fake = {
+    exitCode: 0,
+    killed: false,
+    once() {
+      return this;
+    },
+    kill() {
+      return true;
+    },
+  };
+  const start = Date.now();
+  await cleanupSession(fake, null);
+  assert.ok(Date.now() - start < 1000, "Should not wait for exit timeout");
+});
+
+test("getPages rejects when the server accepts but never responds", async () => {
+  const server = net.createServer(() => {
+    // 接受 TCP 连接但不返回任何 HTTP 响应（模拟半打开连接）
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    await assert.rejects(getPages(port, 300), /超时/);
+  } finally {
+    server.close();
   }
 });

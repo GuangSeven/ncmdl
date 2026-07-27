@@ -73,9 +73,9 @@ function findBrowserExecutable() {
 /**
  * 用 CDP HTTP 接口获取 WebSocket Debugger URL
  */
-function getWebSocketDebuggerUrl(port) {
+function getWebSocketDebuggerUrl(port, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
-    http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
+    const req = http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
       res.on("end", () => {
@@ -86,7 +86,12 @@ function getWebSocketDebuggerUrl(port) {
           reject(new Error(`解析 CDP /json/version 失败: ${e.message}`));
         }
       });
-    }).on("error", reject);
+    });
+    req.on("error", reject);
+    // 防止 CDP 服务器接受连接但不响应（半打开）导致 Promise 永久挂起
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`CDP /json/version 请求超时（${timeoutMs}ms）`));
+    });
   });
 }
 
@@ -134,9 +139,9 @@ async function getCookiesViaCdp(port, timeoutMs = 5000) {
 /**
  * 通过 CDP 获取所有页面信息（用来找 music.163.com 的页面）
  */
-function getPages(port) {
+function getPages(port, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
-    http.get(`http://127.0.0.1:${port}/json`, (res) => {
+    const req = http.get(`http://127.0.0.1:${port}/json`, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
       res.on("end", () => {
@@ -146,7 +151,12 @@ function getPages(port) {
           reject(new Error(`获取页面列表失败: ${e.message}`));
         }
       });
-    }).on("error", reject);
+    });
+    req.on("error", reject);
+    // 防止 CDP 服务器接受连接但不响应（半打开）导致 Promise 永久挂起
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`CDP /json 请求超时（${timeoutMs}ms）`));
+    });
   });
 }
 
@@ -266,21 +276,31 @@ async function autoCaptureCookie(options = {}) {
  * 清理失败不会抛出，以免替换 try 块中的原始错误（如登录超时）。
  */
 async function cleanupSession(browserProcess, userDataDir) {
-  if (browserProcess && browserProcess.exitCode === null && !browserProcess.killed) {
-    const exited = new Promise((resolve) => browserProcess.once("exit", resolve));
-    browserProcess.kill("SIGTERM");
-    const didExit = await Promise.race([
-      exited.then(() => true),
-      new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
-    ]);
-    // SIGTERM 后进程仍存活（如 crash reporter 弹窗），用 SIGKILL 强制终止，
-    // 避免孤儿进程持有文件锁导致临时目录无法删除（Windows 常见）。
-    if (!didExit && browserProcess.exitCode === null) {
-      browserProcess.kill("SIGKILL");
-      await Promise.race([
-        exited,
-        new Promise((resolve) => setTimeout(resolve, 2000)),
+  if (browserProcess && !browserProcess.killed) {
+    // 先注册 exit 监听，再检查 exitCode：若进程在注册前已退出，exit 事件不会重放，
+    // 需手动 resolve，避免 exited 永久 pending（修复检查与注册之间的 TOCTOU 竞态）。
+    let resolveExited;
+    const exited = new Promise((resolve) => {
+      resolveExited = resolve;
+    });
+    browserProcess.once("exit", resolveExited);
+    if (browserProcess.exitCode !== null) {
+      resolveExited();
+    } else {
+      browserProcess.kill("SIGTERM");
+      const didExit = await Promise.race([
+        exited.then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
       ]);
+      // SIGTERM 后进程仍存活（如 crash reporter 弹窗），用 SIGKILL 强制终止，
+      // 避免孤儿进程持有文件锁导致临时目录无法删除（Windows 常见）。
+      if (!didExit && browserProcess.exitCode === null) {
+        browserProcess.kill("SIGKILL");
+        await Promise.race([
+          exited,
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]);
+      }
     }
   }
   if (userDataDir) {
