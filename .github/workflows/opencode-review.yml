@@ -15,7 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          persist-credentials: true
+          persist-credentials: false
+      - name: Configure git identity and remote
+        env:
+          VERIFIER_PAT: ${{ secrets.VERIFIER_PAT }}
+        run: |
+          git config user.email "verifier@xfdbf.me"
+          git config user.name "verifier421"
+          git remote set-url origin https://x-access-token:${VERIFIER_PAT}@github.com/${{ github.repository }}.git
       - uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_VERIFIER_API_KEY }}
