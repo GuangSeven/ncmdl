@@ -19,10 +19,10 @@ jobs:
       - uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_VERIFIER_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           model: opencode/mimo-v2.5-free
-          use_github_token: false
+          use_github_token: true
           prompt: |
             Role Verifier 严苛审查专家
             Core Belief 默认不信。看到已完成就找漏洞。
