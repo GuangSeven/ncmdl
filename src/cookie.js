@@ -241,46 +241,46 @@ async function autoCaptureCookie(options = {}) {
   // 每次运行生成唯一临时目录，避免并发运行时 SingletonLock 冲突，也避免脏数据残留。
   let userDataDir = null;
 
-  if (!existingPort) {
-    // 启动浏览器，开启调试端口
-    // 必须使用独立的 user-data-dir，否则系统里已有 Edge/Chrome 实例时，
-    // 新进程会把 URL 转交给旧实例后立即退出，导致调试端口无效、进程退出报错。
-    userDataDir = makeTempDir();
-    const args = [
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${userDataDir}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-sync",
-      "--disable-background-networking",
-      MUSIC_163_URL, // 启动后直接打开网易云
-    ];
+  // 整个启动+登录流程都在 try 内：spawnBrowser 同步抛出或 waitReady 失败时，
+  // finally 仍能清理已创建的 userDataDir 与子进程，避免泄露。
+  try {
+    if (!existingPort) {
+      // 启动浏览器，开启调试端口
+      // 必须使用独立的 user-data-dir，否则系统里已有 Edge/Chrome 实例时，
+      // 新进程会把 URL 转交给旧实例后立即退出，导致调试端口无效、进程退出报错。
+      userDataDir = makeTempDir();
+      const args = [
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${userDataDir}`,
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        "--disable-background-networking",
+        MUSIC_163_URL, // 启动后直接打开网易云
+      ];
 
-    if (headless) {
-      args.push("--headless=new");
+      if (headless) {
+        args.push("--headless=new");
+      }
+
+      browserProcess = spawnBrowser(browserPath, args, {
+        stdio: "ignore",
+        detached: false,
+      });
+      // spawn 可能异步失败（ENOENT/EACCES 等），必须挂 error 监听，否则变成未捕获异常；
+      // 同时把错误传给 waitForCdpReady，以便快速报出"启动失败/端口被占用"而非干等超时。
+      let spawnError = null;
+      browserProcess.on("error", (err) => {
+        spawnError = err;
+      });
+
+      await waitReady(port, browserProcess, Math.min(timeout, 15000), () => spawnError);
+    } else {
+      console.log("检测到已有浏览器调试实例，复用中...");
     }
 
-    browserProcess = spawnBrowser(browserPath, args, {
-      stdio: "ignore",
-      detached: false,
-    });
-    // spawn 可能异步失败（ENOENT/EACCES 等），必须挂 error 监听，否则变成未捕获异常；
-    // 同时把错误传给 waitForCdpReady，以便快速报出"启动失败/端口被占用"而非干等超时。
-    let spawnError = null;
-    browserProcess.on("error", (err) => {
-      spawnError = err;
-    });
-
-    await waitReady(port, browserProcess, Math.min(timeout, 15000), () => spawnError);
-  } else {
-    console.log("检测到已有浏览器调试实例，复用中...");
-  }
-
-  try {
     // 等待用户登录并获取 Cookie
-    const cookieStr = await waitLogin(port, timeout);
-
-    return cookieStr;
+    return await waitLogin(port, timeout);
   } finally {
     // 如果是复用的已有实例，browserProcess/userDataDir 均为 null，cleanupSession 会跳过。
     // 清理用 try/catch 包裹，避免吞掉 try 块里 waitForLogin 抛出的原始错误。

@@ -15,6 +15,7 @@ const {
   findBrowserExecutable,
   getCookiesViaCdp,
   getPages,
+  getWebSocketDebuggerUrl,
   waitForCdpReady,
   waitForLogin,
 } = require("../src/cookie");
@@ -129,6 +130,80 @@ test("waitForCdpReady resolves debuggerUrl when CDP server responds", async () =
   }
 });
 
+test("waitForCdpReady reports port conflict when a non-CDP server holds the port", async () => {
+  // 端口被占用但不是 CDP 服务：超时后的复检应报"端口被占用"而非普通超时
+  const server = http.createServer((req, res) => {
+    res.statusCode = 404;
+    res.end("<html>not cdp</html>");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const fakeProcess = { exitCode: null, killed: false };
+  try {
+    await assert.rejects(waitForCdpReady(port, fakeProcess, 500), /已被其他实例占用/);
+  } finally {
+    server.close();
+  }
+});
+
+test("getWebSocketDebuggerUrl resolves the debugger url", async () => {
+  const server = http.createServer((req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1/direct" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const url = await getWebSocketDebuggerUrl(server.address().port, 1000);
+    assert.equal(url, "ws://127.0.0.1/direct");
+  } finally {
+    server.close();
+  }
+});
+
+test("getWebSocketDebuggerUrl rejects on non-JSON response", async () => {
+  const server = http.createServer((req, res) => {
+    res.setHeader("Content-Type", "text/html");
+    res.end("<html><body>error page</body></html>");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await assert.rejects(
+      getWebSocketDebuggerUrl(server.address().port, 1000),
+      /解析 CDP \/json\/version 失败/
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test("getWebSocketDebuggerUrl rejects on HTTP 500 with HTML body", async () => {
+  const server = http.createServer((req, res) => {
+    res.statusCode = 500;
+    res.end("<html>Internal Server Error</html>");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await assert.rejects(
+      getWebSocketDebuggerUrl(server.address().port, 1000),
+      /解析 CDP \/json\/version 失败/
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test("getWebSocketDebuggerUrl rejects when the server accepts but never responds", async () => {
+  const server = net.createServer(() => {
+    // 接受 TCP 连接但不返回任何 HTTP 响应（模拟半打开连接）
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await assert.rejects(getWebSocketDebuggerUrl(server.address().port, 300), /超时/);
+  } finally {
+    server.close();
+  }
+});
+
 test("cleanupSession removes the temp user-data-dir", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-test-"));
   assert.equal(fs.existsSync(dir), true);
@@ -137,10 +212,11 @@ test("cleanupSession removes the temp user-data-dir", async () => {
 });
 
 test("cleanupSession does not throw when rmSync fails", async (t) => {
-  t.mock.method(fs, "rmSync", () => {
+  const rmSyncMock = t.mock.method(fs, "rmSync", () => {
     throw new Error("EBUSY");
   });
   await cleanupSession(null, "/nonexistent/ncmdl-test-dir");
+  assert.ok(rmSyncMock.mock.calls.length > 0, "rmSync should have been called");
 });
 
 test("getCookiesViaCdp returns cookies from page target", async () => {
@@ -410,6 +486,27 @@ test("autoCaptureCookie cleans up even when login fails", async () => {
     /登录超时/
   );
   assert.equal(cleanupCalled, true);
+});
+
+test("autoCaptureCookie cleans up the temp dir when spawn throws synchronously", async () => {
+  let cleanupArgs = null;
+  await assert.rejects(
+    autoCaptureCookie({
+      deps: {
+        findBrowserExecutable: () => "/fake/browser",
+        checkPortInUse: async () => false,
+        makeTempDir: () => "/fake/temp/dir",
+        spawn: () => {
+          throw new Error("spawn EACCES");
+        },
+        cleanupSession: async (proc, dir) => {
+          cleanupArgs = { proc, dir };
+        },
+      },
+    }),
+    /spawn EACCES/
+  );
+  assert.deepEqual(cleanupArgs, { proc: null, dir: "/fake/temp/dir" });
 });
 
 test("autoCaptureCookie surfaces async spawn errors via waitForCdpReady", async () => {
