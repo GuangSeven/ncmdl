@@ -22,7 +22,6 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-      workflow: write
       id-token: write
     steps:
       - name: Checkout repository
@@ -37,13 +36,12 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_VERIFIER_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          model: opencode/deepseek-v4-flash-free
+          model: opencode/mimo-v2.5-free
           use_github_token: true
-          variant: max
           share: true
 
   coder:
-    timeout-minutes: 30
+    timeout-minutes: 60
     concurrency:
       group: opencode-coder-${{ github.ref }}
       cancel-in-progress: true
@@ -57,7 +55,6 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-      workflow: write
       id-token: write
     steps:
       - name: Checkout repository
@@ -72,7 +69,6 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_CODER_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          model: opencode/deepseek-v4-flash-free
+          model: opencode/mimo-v2.5-free
           use_github_token: true
-          variant: max
           share: true
