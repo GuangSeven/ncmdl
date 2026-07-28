@@ -73,11 +73,13 @@ function findBrowserExecutable() {
 /**
  * 用 CDP HTTP 接口获取 WebSocket Debugger URL
  */
-function getWebSocketDebuggerUrl(port) {
+function getWebSocketDebuggerUrl(port, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
-    http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
+    const req = http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
+      // 响应体传输中途断开时 res 会发射 error，缺监听会变成未捕获异常
+      res.on("error", reject);
       res.on("end", () => {
         try {
           const json = JSON.parse(data);
@@ -86,19 +88,27 @@ function getWebSocketDebuggerUrl(port) {
           reject(new Error(`解析 CDP /json/version 失败: ${e.message}`));
         }
       });
-    }).on("error", reject);
+    });
+    req.on("error", reject);
+    // 防止 CDP 服务器接受连接但不响应（半打开）导致 Promise 永久挂起
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`CDP /json/version 请求超时（${timeoutMs}ms）`));
+    });
   });
 }
 
 /**
- * 通过浏览器级 CDP WebSocket 获取所有 Cookie（包括 HttpOnly Cookie）。
+ * 通过页面级 CDP WebSocket 获取所有 Cookie（包括 HttpOnly Cookie）。
+ * Storage.getCookies 是 page/target-level 方法，必须连接页面 target 的 WS，
+ * 而非 /json/version 返回的 browser-level WS（后者不支持该方法）。
  */
 async function getCookiesViaCdp(port, timeoutMs = 5000) {
-  const debuggerUrl = await getWebSocketDebuggerUrl(port);
-  if (!debuggerUrl) throw new Error("CDP 未返回 WebSocket 调试地址");
+  const pages = await getPages(port);
+  const page = pages.find((p) => p.type === "page" && p.webSocketDebuggerUrl);
+  if (!page) throw new Error("CDP 未找到可用的页面 target，请确认浏览器已打开页面");
 
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(debuggerUrl);
+    const socket = new WebSocket(page.webSocketDebuggerUrl);
     const timer = setTimeout(() => finish(new Error("CDP Cookie 请求超时")), timeoutMs);
     let finished = false;
 
@@ -118,7 +128,12 @@ async function getCookiesViaCdp(port, timeoutMs = 5000) {
       try {
         const message = JSON.parse(data.toString());
         if (message.id !== 1) return;
-        if (message.error) throw new Error(message.error.message || "CDP 命令失败");
+        if (message.error) {
+          // CDP 命令级错误（如方法不存在/协议不兼容）是确定性失败，重试无意义
+          const cdpError = new Error(message.error.message || "CDP 命令失败");
+          cdpError.nonRetryable = true;
+          throw cdpError;
+        }
         finish(null, message.result?.cookies || []);
       } catch (error) {
         finish(error);
@@ -131,11 +146,13 @@ async function getCookiesViaCdp(port, timeoutMs = 5000) {
 /**
  * 通过 CDP 获取所有页面信息（用来找 music.163.com 的页面）
  */
-function getPages(port) {
+function getPages(port, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
-    http.get(`http://127.0.0.1:${port}/json`, (res) => {
+    const req = http.get(`http://127.0.0.1:${port}/json`, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
+      // 响应体传输中途断开时 res 会发射 error，缺监听会变成未捕获异常
+      res.on("error", reject);
       res.on("end", () => {
         try {
           resolve(JSON.parse(data));
@@ -143,7 +160,12 @@ function getPages(port) {
           reject(new Error(`获取页面列表失败: ${e.message}`));
         }
       });
-    }).on("error", reject);
+    });
+    req.on("error", reject);
+    // 防止 CDP 服务器接受连接但不响应（半打开）导致 Promise 永久挂起
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`CDP /json 请求超时（${timeoutMs}ms）`));
+    });
   });
 }
 
@@ -153,6 +175,7 @@ function getPages(port) {
 async function waitForLogin(port, timeoutMs = 180000) {
   const startTime = Date.now();
   const pollInterval = 2000;
+  let lastError;
 
   while (Date.now() - startTime < timeoutMs) {
     await new Promise((r) => setTimeout(r, pollInterval));
@@ -172,12 +195,17 @@ async function waitForLogin(port, timeoutMs = 180000) {
           .join("; ");
         return cookieStr;
       }
-    } catch {
-      // 轮询时可能 CDP 临时不可用，忽略
+    } catch (error) {
+      // 确定性错误（CDP 协议不兼容等）立即抛出，避免无意义重试 3 分钟
+      if (error.nonRetryable) throw error;
+      // 轮询时 CDP 可能临时不可用，记录最后一次错误用于超时诊断
+      lastError = error;
     }
   }
 
-  throw new Error("等待登录超时（3 分钟），请重试。");
+  throw new Error(
+    `等待登录超时（3 分钟），请重试。${lastError ? ` 最后一次错误: ${lastError.message}` : ""}`
+  );
 }
 
 /**
@@ -190,11 +218,22 @@ async function waitForLogin(port, timeoutMs = 180000) {
  * @returns {Promise<string>} cookie 字符串
  */
 async function autoCaptureCookie(options = {}) {
-  const port = options.port || DEFAULT_CDP_PORT;
-  const headless = options.headless || false;
-  const timeout = options.timeout || 180000;
+  const port = options.port ?? DEFAULT_CDP_PORT;
+  const headless = options.headless ?? false;
+  const timeout = options.timeout ?? 180000;
 
-  const browserPath = findBrowserExecutable();
+  // 依赖注入点：仅供测试替换底层实现，正常调用无需传入。
+  const deps = options.deps ?? {};
+  const findBrowser = deps.findBrowserExecutable ?? findBrowserExecutable;
+  const checkPort = deps.checkPortInUse ?? checkPortInUse;
+  const spawnBrowser = deps.spawn ?? spawn;
+  const waitReady = deps.waitForCdpReady ?? waitForCdpReady;
+  const waitLogin = deps.waitForLogin ?? waitForLogin;
+  const cleanup = deps.cleanupSession ?? cleanupSession;
+  const makeTempDir =
+    deps.makeTempDir ?? (() => fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-cdp-")));
+
+  const browserPath = findBrowser();
   if (!browserPath) {
     throw new Error(
       "未找到 Edge/Chrome 浏览器。如果你已安装，请手动复制 Cookie 后运行 `node src/cli.js config show` 确认。"
@@ -208,62 +247,133 @@ async function autoCaptureCookie(options = {}) {
   }
 
   // 先检查端口是否已被占用（可能已有浏览器调试实例在运行）
-  const existingPort = await checkPortInUse(port);
+  const existingPort = await checkPort(port);
   let browserProcess = null;
+  // 每次运行生成唯一临时目录，避免并发运行时 SingletonLock 冲突，也避免脏数据残留。
+  let userDataDir = null;
 
-  if (!existingPort) {
-    // 启动浏览器，开启调试端口
-    const args = [
-      `--remote-debugging-port=${port}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-sync",
-      "--disable-background-networking",
-      MUSIC_163_URL, // 启动后直接打开网易云
-    ];
-
-    if (headless) {
-      args.push("--headless=new");
-    }
-
-    browserProcess = spawn(browserPath, args, {
-      stdio: "ignore",
-      detached: false,
-    });
-
-    await waitForCdpReady(port, browserProcess, Math.min(timeout, 15000));
-  } else {
-    console.log("检测到已有浏览器调试实例，复用中...");
-  }
-
+  // 整个启动+登录流程都在 try 内：spawnBrowser 同步抛出或 waitReady 失败时，
+  // finally 仍能清理已创建的 userDataDir 与子进程，避免泄露。
   try {
-    // 等待用户登录并获取 Cookie
-    const cookieStr = await waitForLogin(port, timeout);
+    if (!existingPort) {
+      // 启动浏览器，开启调试端口
+      // 必须使用独立的 user-data-dir，否则系统里已有 Edge/Chrome 实例时，
+      // 新进程会把 URL 转交给旧实例后立即退出，导致调试端口无效、进程退出报错。
+      userDataDir = makeTempDir();
+      const args = [
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${userDataDir}`,
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        "--disable-background-networking",
+        MUSIC_163_URL, // 启动后直接打开网易云
+      ];
 
-    return cookieStr;
-  } finally {
-    // 关闭浏览器（只关我们自己启动的），并防止进程已退出时错过 exit 事件。
-    if (browserProcess && browserProcess.exitCode === null && !browserProcess.killed) {
-      const exited = new Promise((resolve) => browserProcess.once("exit", resolve));
-      browserProcess.kill();
-      await Promise.race([
-        exited,
-        new Promise((resolve) => setTimeout(resolve, 3000)),
-      ]);
+      if (headless) {
+        args.push("--headless=new");
+      }
+
+      browserProcess = spawnBrowser(browserPath, args, {
+        stdio: "ignore",
+        detached: false,
+      });
+      // spawn 可能异步失败（ENOENT/EACCES 等），必须挂 error 监听，否则变成未捕获异常；
+      // 同时把错误传给 waitForCdpReady，以便快速报出"启动失败/端口被占用"而非干等超时。
+      let spawnError = null;
+      browserProcess.on("error", (err) => {
+        spawnError = err;
+      });
+
+      await waitReady(port, browserProcess, Math.min(timeout, 15000), () => spawnError);
+    } else {
+      console.log("检测到已有浏览器调试实例，复用中...");
     }
-    // 如果是复用的已有实例，不关闭它。
+
+    // 等待用户登录并获取 Cookie
+    return await waitLogin(port, timeout);
+  } finally {
+    // 如果是复用的已有实例，browserProcess/userDataDir 均为 null，cleanupSession 会跳过。
+    // 清理用 try/catch 包裹，避免吞掉 try 块里 waitForLogin 抛出的原始错误。
+    await cleanup(browserProcess, userDataDir);
+  }
+}
+
+/**
+ * 关闭本次启动的浏览器进程并清理临时 user-data-dir。
+ * 清理失败不会抛出，以免替换 try 块中的原始错误（如登录超时）。
+ */
+async function cleanupSession(browserProcess, userDataDir) {
+  if (browserProcess && !browserProcess.killed) {
+    // 先注册 exit 监听，再检查 exitCode：若进程在注册前已退出，exit 事件不会重放，
+    // 需手动 resolve，避免 exited 永久 pending（修复检查与注册之间的 TOCTOU 竞态）。
+    let resolveExited;
+    const exited = new Promise((resolve) => {
+      resolveExited = resolve;
+    });
+    browserProcess.once("exit", resolveExited);
+    // 被信号杀死（OOM/SIGSEGV）时 exitCode 为 null 而 signalCode 有值，
+    // 同样视为已退出，避免对死进程发 SIGTERM 后白等 5 秒超时。
+    if (browserProcess.exitCode !== null || browserProcess.signalCode != null) {
+      resolveExited();
+    } else {
+      browserProcess.kill("SIGTERM");
+      const didExit = await Promise.race([
+        exited.then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
+      ]);
+      // SIGTERM 后进程仍存活（如 crash reporter 弹窗），用 SIGKILL 强制终止，
+      // 避免孤儿进程持有文件锁导致临时目录无法删除（Windows 常见）。
+      if (!didExit && browserProcess.exitCode === null) {
+        browserProcess.kill("SIGKILL");
+        await Promise.race([
+          exited,
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]);
+      }
+    }
+  }
+  if (userDataDir) {
+    try {
+      fs.rmSync(userDataDir, { force: true, recursive: true });
+    } catch {
+      // 清理失败不应影响原始错误传播
+    }
   }
 }
 
 /**
  * 等待 CDP HTTP 服务真正可用，而不是依赖固定延时。
+ *
+ * @param {number} port
+ * @param {object|null} browserProcess   浏览器子进程（复用已有实例时为 null）
+ * @param {number} [timeoutMs]
+ * @param {() => (Error|null)} [getSpawnError]  返回异步 spawn 错误的取值器（可选）
  */
-async function waitForCdpReady(port, browserProcess, timeoutMs = 15000) {
+async function waitForCdpReady(port, browserProcess, timeoutMs = 15000, getSpawnError = null) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
-    if (browserProcess?.exitCode !== null) {
-      throw new Error("浏览器启动失败，请检查是否有其他实例已在运行。");
+    const spawnError = getSpawnError?.();
+    if (spawnError) {
+      throw new Error(
+        `浏览器启动失败: ${spawnError.message}（可能是浏览器路径无效或调试端口被占用）`
+      );
+    }
+    // 用 != null 同时排除 null 与 undefined：browserProcess 为 null（复用实例）
+    // 或进程尚未退出时都不应误报 "exit code undefined"。
+    // 被信号杀死（SIGKILL/OOM/SIGSEGV）时 exitCode 为 null 而 signalCode 有值，需一并检测。
+    if (
+      browserProcess &&
+      (browserProcess.exitCode != null || browserProcess.signalCode != null)
+    ) {
+      const reason =
+        browserProcess.signalCode != null
+          ? `被信号 ${browserProcess.signalCode} 终止`
+          : `exit code ${browserProcess.exitCode}`;
+      throw new Error(
+        `浏览器进程已退出（${reason}），可能是启动失败或存在实例冲突，请检查后重试。`
+      );
     }
     try {
       const debuggerUrl = await getWebSocketDebuggerUrl(port);
@@ -273,7 +383,16 @@ async function waitForCdpReady(port, browserProcess, timeoutMs = 15000) {
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  throw new Error(`等待浏览器调试端口就绪超时${lastError ? `: ${lastError.message}` : ""}`);
+  // 超时后再确认一次端口状态，区分"端口被其他实例占用"（TOCTOU：检查后被抢）
+  // 与"单纯启动慢"，给出更明确的错误。
+  if (await checkPortInUse(port)) {
+    throw new Error(
+      `浏览器调试端口 ${port} 已被其他实例占用，无法建立 CDP 连接。请关闭占用该端口的浏览器实例后重试。`
+    );
+  }
+  throw new Error(
+    `等待浏览器调试端口就绪超时${lastError ? `: ${lastError.message}` : ""}。`
+  );
 }
 
 /**
@@ -294,6 +413,7 @@ function checkPortInUse(port) {
 module.exports = {
   autoCaptureCookie,
   checkPortInUse,
+  cleanupSession,
   findBrowserExecutable,
   getCookiesViaCdp,
   getPages,
