@@ -11,6 +11,7 @@ const {
   maskSecret,
   saveConfig
 } = require("./config");
+const { version: APP_VERSION } = require("../package.json");
 const {
   DEFAULT_USER_AGENT,
   buildSongOutputPath,
@@ -47,7 +48,7 @@ function printHelp() {
 function printMenu() {
   stdout.write(`
 ╔══════════════════════════════════════════════╗
-║        网易云音乐终端版下载工具 v1.0.0       ║
+║       网易云音乐终端版下载工具 v${APP_VERSION}       ║
 ╠══════════════════════════════════════════════╣
 ║  1. 抓取 Cookie (自动打开浏览器登录)        ║
 ║  2. 手动输入配置                             ║
@@ -75,47 +76,64 @@ async function handleMenuChoice(choice, config) {
       } catch (err) {
         console.error(`抓取 Cookie 失败: ${err.message}`);
       }
-      break;
+      return { continue: true, config };
 
     case "2":
-      await setupWizard(config);
-      break;
+      config = await setupWizard(config);
+      return { continue: true, config };
 
     case "3":
       const targetInput = await askVisible("请输入歌曲 ID 或链接");
       if (!targetInput) {
         stdout.write("未输入歌曲 ID 或链接，返回菜单。\n");
-        break;
+        return { continue: true, config };
       }
-      config.cookie = await resolveCookie(config, { cookie: "" });
+      if (config.cookie) {
+        stdout.write(`当前 Cookie: ${maskSecret(config.cookie)}\n`);
+        const keepCookie = await askVisible("是否使用当前 Cookie？(y/n)", "y");
+        if (keepCookie.toLowerCase() !== "y") {
+          const newCookie = await askHidden("请粘贴新的网易云网页 Cookie");
+          if (newCookie) {
+            config.cookie = newCookie;
+          }
+        }
+      } else {
+        config.cookie = await resolveCookie(config, { cookie: "" });
+      }
       if (!config.cookie) {
         stdout.write("缺少 Cookie，无法下载。请先抓取或手动输入 Cookie。\n");
-        break;
+        return { continue: true, config };
       }
       try {
         await downloadSongFlow(targetInput, config);
       } catch (err) {
         console.error(`下载失败: ${err.message}`);
       }
-      break;
+      return { continue: true, config };
 
     case "4":
       showConfig(config);
-      break;
+      return { continue: true, config };
 
     case "5":
-      await saveConfig(DEFAULT_CONFIG);
-      stdout.write("配置已重置。\n");
-      break;
+      const confirm = await askVisible("确认重置所有配置？(y/n)", "n");
+      if (confirm.toLowerCase() === "y") {
+        await saveConfig(DEFAULT_CONFIG);
+        config = Object.assign({}, DEFAULT_CONFIG);
+        stdout.write("配置已重置。\n");
+      } else {
+        stdout.write("已取消重置。\n");
+      }
+      return { continue: true, config };
 
     case "0":
       stdout.write("再见！\n");
-      return false;
+      return { continue: false, config };
 
     default:
       stdout.write("无效的选择，请重新输入。\n");
+      return { continue: true, config };
   }
-  return true;
 }
 
 async function interactiveMenu() {
@@ -131,8 +149,9 @@ async function interactiveMenu() {
   while (true) {
     printMenu();
     const choice = await askVisible("请选择功能 (0-5)");
-    const shouldContinue = await handleMenuChoice(choice, config);
-    if (!shouldContinue) break;
+    const result = await handleMenuChoice(choice, config);
+    config = result.config;
+    if (!result.continue) break;
     stdout.write("\n");
   }
 }
@@ -205,6 +224,7 @@ async function setupWizard(currentConfig) {
   });
   await saveConfig(nextConfig);
   stdout.write("配置已保存。\n");
+  return nextConfig;
 }
 
 function showConfig(config) {
