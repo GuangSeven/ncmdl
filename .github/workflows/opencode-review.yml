@@ -22,7 +22,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           model: opencode/mimo-v2.5-free
-          use_github_token: true
+          use_github_token: false
           prompt: |
             Role Verifier 严苛审查专家
             Core Belief 默认不信。看到已完成就找漏洞。
