@@ -100,6 +100,14 @@ test("waitForCdpReady throws when browser process already exited", async () => {
   await assert.rejects(waitForCdpReady(9, fakeProcess, 1000), /exit code 1/);
 });
 
+test("waitForCdpReady throws when browser process was killed by a signal", async () => {
+  // 被信号杀死时 exitCode 为 null、signalCode 有值，应立即报错而非空等超时
+  const fakeProcess = { exitCode: null, signalCode: "SIGKILL", killed: true };
+  const start = Date.now();
+  await assert.rejects(waitForCdpReady(9, fakeProcess, 15000), /被信号 SIGKILL 终止/);
+  assert.ok(Date.now() - start < 1000, "Should fail fast, not wait for timeout");
+});
+
 test("waitForCdpReady throws timeout when no CDP server responds", async () => {
   const server = net.createServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -246,6 +254,94 @@ test("getCookiesViaCdp throws when no page target available", async () => {
     await assert.rejects(getCookiesViaCdp(port, 1000), /未找到可用的页面 target/);
   } finally {
     httpServer.close();
+  }
+});
+
+test("getCookiesViaCdp rejects when the WebSocket connection fails", async () => {
+  // 占一个空闲端口作为不可达的 WS 地址（无监听 → 连接拒绝 → error 事件）
+  const probe = net.createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const deadPort = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const httpServer = http.createServer((req, res) => {
+    if (req.url === "/json") {
+      res.end(
+        JSON.stringify([
+          { type: "page", webSocketDebuggerUrl: `ws://127.0.0.1:${deadPort}/devtools/page/dead` },
+        ])
+      );
+    }
+  });
+  await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+  const port = httpServer.address().port;
+  try {
+    await assert.rejects(getCookiesViaCdp(port, 2000), (error) => {
+      assert.ok(error instanceof Error);
+      assert.ok(!error.message.includes("请求超时"), "Should fail via WS error, not timeout");
+      return true;
+    });
+  } finally {
+    httpServer.close();
+  }
+});
+
+/**
+ * 创建一个 WS 对 Storage.getCookies 返回 CDP 命令级错误的模拟服务器。
+ */
+function createCdpErrorServer(errorMessage) {
+  const httpServer = http.createServer((req, res) => {
+    if (req.url === "/json") {
+      const port = httpServer.address().port;
+      res.end(
+        JSON.stringify([
+          { type: "page", webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/mock` },
+        ])
+      );
+    }
+  });
+  const wss = new WebSocket.Server({ server: httpServer });
+  wss.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const msg = JSON.parse(data.toString());
+      ws.send(JSON.stringify({ id: msg.id, error: { message: errorMessage } }));
+    });
+  });
+  return {
+    listen: () => new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve)),
+    get port() {
+      return httpServer.address().port;
+    },
+    close: () => {
+      wss.close();
+      httpServer.close();
+    },
+  };
+}
+
+test("getCookiesViaCdp marks CDP command errors as nonRetryable", async () => {
+  const mock = createCdpErrorServer("'Storage.getCookies' wasn't found");
+  await mock.listen();
+  try {
+    await assert.rejects(getCookiesViaCdp(mock.port, 2000), (error) => {
+      assert.match(error.message, /Storage\.getCookies/);
+      assert.equal(error.nonRetryable, true);
+      return true;
+    });
+  } finally {
+    mock.close();
+  }
+});
+
+test("waitForLogin fails fast on a non-retryable CDP command error", async () => {
+  const mock = createCdpErrorServer("'Storage.getCookies' wasn't found");
+  await mock.listen();
+  try {
+    const start = Date.now();
+    await assert.rejects(waitForLogin(mock.port, 60000), /Storage\.getCookies/);
+    assert.ok(Date.now() - start < 10000, "Should throw immediately, not retry until timeout");
+  } finally {
+    mock.close();
   }
 });
 

@@ -126,7 +126,12 @@ async function getCookiesViaCdp(port, timeoutMs = 5000) {
       try {
         const message = JSON.parse(data.toString());
         if (message.id !== 1) return;
-        if (message.error) throw new Error(message.error.message || "CDP 命令失败");
+        if (message.error) {
+          // CDP 命令级错误（如方法不存在/协议不兼容）是确定性失败，重试无意义
+          const cdpError = new Error(message.error.message || "CDP 命令失败");
+          cdpError.nonRetryable = true;
+          throw cdpError;
+        }
         finish(null, message.result?.cookies || []);
       } catch (error) {
         finish(error);
@@ -187,6 +192,8 @@ async function waitForLogin(port, timeoutMs = 180000) {
         return cookieStr;
       }
     } catch (error) {
+      // 确定性错误（CDP 协议不兼容等）立即抛出，避免无意义重试 3 分钟
+      if (error.nonRetryable) throw error;
       // 轮询时 CDP 可能临时不可用，记录最后一次错误用于超时诊断
       lastError = error;
     }
@@ -349,9 +356,17 @@ async function waitForCdpReady(port, browserProcess, timeoutMs = 15000, getSpawn
     }
     // 用 != null 同时排除 null 与 undefined：browserProcess 为 null（复用实例）
     // 或进程尚未退出时都不应误报 "exit code undefined"。
-    if (browserProcess && browserProcess.exitCode != null) {
+    // 被信号杀死（SIGKILL/OOM/SIGSEGV）时 exitCode 为 null 而 signalCode 有值，需一并检测。
+    if (
+      browserProcess &&
+      (browserProcess.exitCode != null || browserProcess.signalCode != null)
+    ) {
+      const reason =
+        browserProcess.signalCode != null
+          ? `被信号 ${browserProcess.signalCode} 终止`
+          : `exit code ${browserProcess.exitCode}`;
       throw new Error(
-        `浏览器进程已退出（exit code ${browserProcess.exitCode}），可能是启动失败或存在实例冲突，请检查后重试。`
+        `浏览器进程已退出（${reason}），可能是启动失败或存在实例冲突，请检查后重试。`
       );
     }
     try {
