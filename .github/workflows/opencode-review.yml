@@ -18,12 +18,11 @@ jobs:
           persist-credentials: true
       - uses: anomalyco/opencode/github@latest
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_VERIFIER_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          model: opencode/deepseek-v4-flash-free
+          model: opencode/mimo-v2.5-free
           use_github_token: true
-          variant: max
           prompt: |
             Role Verifier 严苛审查专家
             Core Belief 默认不信。看到已完成就找漏洞。
