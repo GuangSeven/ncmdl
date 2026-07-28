@@ -37,7 +37,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           model: opencode/mimo-v2.5-free
-          use_github_token: true
+          use_github_token: false
           share: true
           prompt: |
             Role Verifier 严苛审查专家
@@ -89,7 +89,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           model: opencode/mimo-v2.5-free
-          use_github_token: true
+          use_github_token: false
           share: true
           prompt: |
             Role Coder 务实型代码工匠
