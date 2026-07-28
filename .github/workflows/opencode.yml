@@ -44,7 +44,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_VERIFIER_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
         with:
-          model: opencode/mimo-v2.5-free
+          model: opencode/Laguna-S-2.1-free
           use_github_token: true
           share: true
           prompt: |
@@ -104,7 +104,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_CODER_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
         with:
-          model: opencode/mimo-v2.5-free
+          model: opencode/deepseek-v4-flash-free
           use_github_token: true
           share: true
           prompt: |
