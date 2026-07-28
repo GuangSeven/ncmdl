@@ -78,6 +78,8 @@ function getWebSocketDebuggerUrl(port, timeoutMs = 5000) {
     const req = http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
+      // 响应体传输中途断开时 res 会发射 error，缺监听会变成未捕获异常
+      res.on("error", reject);
       res.on("end", () => {
         try {
           const json = JSON.parse(data);
@@ -149,6 +151,8 @@ function getPages(port, timeoutMs = 5000) {
     const req = http.get(`http://127.0.0.1:${port}/json`, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
+      // 响应体传输中途断开时 res 会发射 error，缺监听会变成未捕获异常
+      res.on("error", reject);
       res.on("end", () => {
         try {
           resolve(JSON.parse(data));
@@ -308,7 +312,9 @@ async function cleanupSession(browserProcess, userDataDir) {
       resolveExited = resolve;
     });
     browserProcess.once("exit", resolveExited);
-    if (browserProcess.exitCode !== null) {
+    // 被信号杀死（OOM/SIGSEGV）时 exitCode 为 null 而 signalCode 有值，
+    // 同样视为已退出，避免对死进程发 SIGTERM 后白等 5 秒超时。
+    if (browserProcess.exitCode !== null || browserProcess.signalCode != null) {
       resolveExited();
     } else {
       browserProcess.kill("SIGTERM");

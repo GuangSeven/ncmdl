@@ -212,11 +212,49 @@ test("getWebSocketDebuggerUrl rejects when the server accepts but never responds
   }
 });
 
-test("cleanupSession removes the temp user-data-dir", async () => {
+test("getWebSocketDebuggerUrl rejects when the connection drops mid-response", async () => {
+  // 发送响应头 + 部分响应体后强制断开，触发 res 流的 error 路径
+  const server = http.createServer((req, res) => {
+    res.setHeader("Content-Length", "1000");
+    res.write('{"webSocketDebugger');
+    setTimeout(() => res.destroy(), 50);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await assert.rejects(getWebSocketDebuggerUrl(server.address().port, 2000));
+  } finally {
+    server.close();
+  }
+});
+
+test("cleanupSession removes the temp user-data-dir", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-test-"));
+  t.after(() => fs.rmSync(dir, { force: true, recursive: true }));
   assert.equal(fs.existsSync(dir), true);
   await cleanupSession(null, dir);
   assert.equal(fs.existsSync(dir), false);
+});
+
+test("cleanupSession resolves immediately for a signal-killed process", async () => {
+  // 外部信号杀死：exitCode 为 null、signalCode 有值、killed 为 false，
+  // exit 事件已发射不会重放，应立即返回而非发 SIGTERM 后空等 5 秒
+  let killCalled = false;
+  const fake = {
+    exitCode: null,
+    signalCode: "SIGKILL",
+    killed: false,
+    once() {
+      return this;
+    },
+    kill() {
+      killCalled = true;
+      return true;
+    },
+  };
+  const start = Date.now();
+  await cleanupSession(fake, null);
+  assert.ok(Date.now() - start < 1000, "Should not wait for SIGTERM/SIGKILL timeouts");
+  assert.equal(killCalled, false, "Should not signal an already-dead process");
 });
 
 test("cleanupSession does not throw when rmSync fails", async (t) => {
