@@ -38,7 +38,103 @@ function printHelp() {
   --out            覆盖下载目录
   --pattern        文件名模式: artist-title | title-artist | title
   -h, --help       显示帮助
+
+交互模式:
+  直接运行 node src/cli.js 进入交互式菜单
 `);
+}
+
+function printMenu() {
+  stdout.write(`
+╔══════════════════════════════════════════════╗
+║        网易云音乐终端版下载工具 v1.0.0       ║
+╠══════════════════════════════════════════════╣
+║  1. 抓取 Cookie (自动打开浏览器登录)        ║
+║  2. 手动输入配置                             ║
+║  3. 下载歌曲                                 ║
+║  4. 查看配置                                 ║
+║  5. 重置配置                                 ║
+║  0. 退出                                     ║
+╚══════════════════════════════════════════════╝
+`);
+}
+
+async function handleMenuChoice(choice, config) {
+  switch (choice) {
+    case "1":
+      stdout.write("\n正在启动浏览器抓取 Cookie...\n");
+      try {
+        const cookieStr = await autoCaptureCookie({ headless: false });
+        if (!cookieStr) {
+          throw new Error("未能获取到 Cookie，请重试。");
+        }
+        config.cookie = cookieStr;
+        await saveConfig(config);
+        stdout.write("\nCookie 已保存到本地配置。\n");
+        stdout.write(`Cookie: ${maskSecret(cookieStr)}\n`);
+      } catch (err) {
+        console.error(`抓取 Cookie 失败: ${err.message}`);
+      }
+      break;
+
+    case "2":
+      await setupWizard(config);
+      break;
+
+    case "3":
+      const targetInput = await askVisible("请输入歌曲 ID 或链接");
+      if (!targetInput) {
+        stdout.write("未输入歌曲 ID 或链接，返回菜单。\n");
+        break;
+      }
+      config.cookie = await resolveCookie(config, { cookie: "" });
+      if (!config.cookie) {
+        stdout.write("缺少 Cookie，无法下载。请先抓取或手动输入 Cookie。\n");
+        break;
+      }
+      try {
+        await downloadSongFlow(targetInput, config);
+      } catch (err) {
+        console.error(`下载失败: ${err.message}`);
+      }
+      break;
+
+    case "4":
+      showConfig(config);
+      break;
+
+    case "5":
+      await saveConfig(DEFAULT_CONFIG);
+      stdout.write("配置已重置。\n");
+      break;
+
+    case "0":
+      stdout.write("再见！\n");
+      return false;
+
+    default:
+      stdout.write("无效的选择，请重新输入。\n");
+  }
+  return true;
+}
+
+async function interactiveMenu() {
+  let config = await loadConfig();
+  config = mergeRuntimeConfig(config, {
+    cookie: process.env.NCM_COOKIE || "",
+    userAgent: process.env.NCM_USER_AGENT || "",
+    quality: process.env.NCM_QUALITY || "",
+    out: process.env.NCM_DOWNLOAD_DIR || "",
+    pattern: process.env.NCM_FILENAME_PATTERN || ""
+  });
+
+  while (true) {
+    printMenu();
+    const choice = await askVisible("请选择功能 (0-5)");
+    const shouldContinue = await handleMenuChoice(choice, config);
+    if (!shouldContinue) break;
+    stdout.write("\n");
+  }
 }
 
 async function askVisible(question, defaultValue = "") {
@@ -180,6 +276,12 @@ async function main() {
 
   if (parsed.values.help || command === "help" || command === "-h" || command === "--help") {
     printHelp();
+    return;
+  }
+
+  // 如果没有提供任何参数，进入交互式菜单
+  if (positionals.length === 0 && !parsed.values.cookie && !parsed.values["user-agent"] && !parsed.values.quality && !parsed.values.out && !parsed.values.pattern) {
+    await interactiveMenu();
     return;
   }
 
