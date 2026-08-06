@@ -31,6 +31,7 @@
 先安装 Node.js 18 或更高版本，然后在仓库根目录执行：
 
 ```bash
+node src/cli.js                     # 进入交互式菜单
 node src/cli.js setup               # 手动输入配置
 node src/cli.js cookie              # 自动打开浏览器抓取 Cookie（推荐）
 node src/cli.js download 123456
@@ -38,11 +39,29 @@ node src/cli.js download https://music.163.com/song?id=123456
 node src/cli.js config show
 ```
 
+## 交互式菜单
+
+直接运行 `node src/cli.js` 进入交互式菜单，无需记忆命令行参数：
+
+| 选项 | 功能 |
+|------|------|
+| 1 | 抓取 Cookie（自动打开浏览器登录） |
+| 2 | 手动输入配置 |
+| 3 | 下载歌曲 |
+| 4 | 查看配置 |
+| 5 | 重置配置（需确认） |
+| 0 | 退出 |
+
+菜单支持终端与脚本两种输入方式：
+
+- 终端（TTY）下按提示操作即可，Cookie 输入支持直接粘贴。
+- 脚本/管道输入时逐行喂入选项即可，例如 `printf "4\n0\n" | node src/cli.js`；此时下载不会再询问是否更换 Cookie，直接使用现有配置。
+
 ## 交互方式
 
 终端版不会再弹出 SweetAlert 或依赖网页按钮。当前脚本采用这几种交互方式：
 
-- 没有传歌曲参数时，会直接在终端里提示你输入歌曲 ID 或链接。
+- 没有传歌曲参数时（`node src/cli.js download`），会直接在终端里提示你输入歌曲 ID 或链接。
 - 没有配置 cookie 时，会在初始化或下载时提示你补录。
 - `config show` 只会展示脱敏后的 Cookie，避免直接把敏感信息打印到屏幕上。
 

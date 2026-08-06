@@ -200,7 +200,9 @@ const lineQueue = [];
 let visibleBuffer = "";
 let hiddenRead = null;
 let prevChar = "";
-let suppressNextLine = false;
+// hidden 以 \r 结束时置位：跨 chunk 一次性吸收紧随其后的 \n（CRLF 粘贴尾部），
+// 避免 \r 与 \n 拆到不同 data chunk 时产生幽灵空行；仅吸收一个字符，之后新行正常入队
+let pendingHiddenLf = false;
 
 function wakeLineWaiter() {
   if (lineWaiter) {
@@ -248,9 +250,6 @@ function onInputClose() {
 
 function onInputData(chunk) {
   const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-  if (suppressNextLine) {
-    suppressNextLine = false;
-  }
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
     if (hiddenRead) {
@@ -262,7 +261,7 @@ function onInputData(chunk) {
       if (result === "finish") {
         const read = hiddenRead;
         hiddenRead = null;
-        suppressNextLine = true;
+        pendingHiddenLf = char === "\r";
         prevChar = "";
         visibleBuffer = "";
         if (stdin.isTTY) {
@@ -273,12 +272,14 @@ function onInputData(chunk) {
       }
       continue;
     }
-    if (char === "\r" || char === "\n" || char === "\u0004") {
-      if (suppressNextLine && char !== "\u0004") {
+    if (pendingHiddenLf) {
+      pendingHiddenLf = false;
+      if (char === "\n") {
         prevChar = char;
         continue;
       }
-      suppressNextLine = false;
+    }
+    if (char === "\r" || char === "\n" || char === "\u0004") {
       if (char === "\n" && prevChar === "\r") {
         prevChar = char;
         continue;
@@ -296,7 +297,6 @@ function onInputData(chunk) {
     }
     visibleBuffer += char;
     prevChar = "";
-    suppressNextLine = false;
   }
 }
 

@@ -6,6 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const CLI_PATH = path.join(__dirname, "..", "src", "cli.js");
+const { DEFAULT_CONFIG } = require("../src/config");
 
 const WINDOWS_SKIP =
   "Windows 匿名管道经 fs.fstatSync 无法识别为可交互输入，脚本化菜单测试不适用";
@@ -259,6 +260,103 @@ test("TTY：hidden 粘贴以 CRLF 结尾时不产生幽灵空行（修复前菜�
   );
   assert.equal(config.cookie, "MUSIC_U=PASTE", "config.json 应写入粘贴的 Cookie");
   assert.doesNotMatch(stdout, /无效的选择/, "CRLF 粘贴不应产生幽灵空行");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：CR 与 LF 拆分到不同 chunk 到达时不产生幽灵空行（回归：抑制依赖 chunk 边界）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=SPLIT\r" },
+      { trigger: "下载失败", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=SPLIT", "拆分到达的 CRLF 粘贴应完整保存");
+  assert.doesNotMatch(stdout, /无效的选择/, "CR 与 LF 拆分到达不应产生幽灵空行");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 3 选择保留当前 Cookie 时直接下载且不改写配置", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "y\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "选 y 时不应改写已保存的 Cookie");
+  assert.match(stdout, /下载失败/, "应使用当前 Cookie 进入下载流程");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 5 重置配置需 y 确认并落盘默认配置", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "5\n" },
+      { trigger: "确认重置所有配置", send: "y\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  const expected = { ...DEFAULT_CONFIG, downloadDir: path.join(home, "Downloads", "ncmdl") };
+  assert.deepEqual(config, expected, "确认重置后应写入默认配置");
+  assert.match(stdout, /配置已重置。/);
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 5 重置配置输入 n 取消且不改写配置", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "5\n" },
+      { trigger: "确认重置所有配置", send: "n\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "取消重置时配置应保持不变");
+  assert.match(stdout, /已取消重置。/);
   assert.match(stdout, /再见！/);
 });
 
