@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 const fs = require("node:fs");
-const readline = require("node:readline/promises");
 const { stdin, stdout, exit } = require("node:process");
 const { parseArgs } = require("node:util");
 
@@ -175,100 +174,158 @@ async function interactiveMenu() {
     if (!result.continue) break;
     stdout.write("\n");
   }
+  stopInputReader();
 }
 
-let persistentRl = null;
+function stopInputReader() {
+  if (!inputStarted) {
+    return;
+  }
+  stdin.off("data", onInputData);
+  stdin.off("close", onInputClose);
+  if (stdin.isTTY) {
+    stdin.setRawMode(false);
+  }
+  stdin.pause();
+  inputStarted = false;
+}
+
+let inputStarted = false;
 let stdinEof = false;
 let lineWaiter = null;
 const lineQueue = [];
+let visibleBuffer = "";
+let hiddenRead = null;
+let prevChar = "";
 
-function ensurePersistentRl() {
-  if (persistentRl) {
+function wakeLineWaiter() {
+  if (lineWaiter) {
+    const wake = lineWaiter;
+    lineWaiter = null;
+    wake();
+  }
+}
+
+function handleHiddenChar(state, char) {
+  if (char === "\u0003") {
+    return "exit";
+  }
+  if (char === "\r" || char === "\n" || char === "\u0004") {
+    return "finish";
+  }
+  if (char === "\u007f" || char === "\b") {
+    state.buffer.pop();
+    return "continue";
+  }
+  state.buffer.push(char);
+  return "continue";
+}
+
+function processHiddenInput(buffer, text) {
+  const state = { buffer };
+  for (const char of text) {
+    const result = handleHiddenChar(state, char);
+    if (result !== "continue") {
+      return result;
+    }
+  }
+  return "continue";
+}
+
+function ensureInputReader() {
+  if (inputStarted) {
     return;
   }
-  persistentRl = readline.createInterface({ input: stdin });
-  persistentRl.on("line", (line) => {
-    lineQueue.push(line);
-    if (lineWaiter) {
-      const wake = lineWaiter;
-      lineWaiter = null;
-      wake();
+  inputStarted = true;
+  stdin.setEncoding("utf8");
+  stdin.resume();
+  stdin.on("data", onInputData);
+  stdin.on("close", onInputClose);
+}
+
+function onInputClose() {
+  stdinEof = true;
+  wakeLineWaiter();
+  if (hiddenRead) {
+    const read = hiddenRead;
+    hiddenRead = null;
+    read.resolve(read.buffer.join(""));
+  }
+}
+
+function onInputData(chunk) {
+  const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (hiddenRead) {
+      const result = handleHiddenChar(hiddenRead, char);
+      if (result === "exit") {
+        exit(130);
+        return;
+      }
+      if (result === "finish") {
+        const read = hiddenRead;
+        hiddenRead = null;
+        if (stdin.isTTY) {
+          stdin.setRawMode(false);
+          stdout.write("\n");
+        }
+        read.resolve(read.buffer.join("").trim());
+      }
+      continue;
     }
-  });
-  persistentRl.on("close", () => {
-    stdinEof = true;
-    if (lineWaiter) {
-      const wake = lineWaiter;
-      lineWaiter = null;
-      wake();
+    if (char === "\r" || char === "\n" || char === "\u0004") {
+      if (char === "\n" && prevChar === "\r") {
+        prevChar = char;
+        continue;
+      }
+      lineQueue.push(visibleBuffer);
+      visibleBuffer = "";
+      prevChar = char;
+      wakeLineWaiter();
+      continue;
     }
-  });
+    if (char === "\u007f" || char === "\b") {
+      visibleBuffer = visibleBuffer.slice(0, -1);
+      prevChar = "";
+      continue;
+    }
+    visibleBuffer += char;
+    prevChar = "";
+  }
 }
 
 async function askVisible(question, defaultValue = "") {
   const suffix = defaultValue ? ` [${defaultValue}]` : "";
-  if (stdin.isTTY) {
-    const rl = readline.createInterface({ input: stdin, output: stdout });
-    const answer = await rl.question(`${question}${suffix}: `);
-    rl.close();
-    return answer.trim() || defaultValue;
-  }
-  ensurePersistentRl();
-  if (stdinEof && lineQueue.length === 0) {
-    return "";
-  }
+  ensureInputReader();
   stdout.write(`${question}${suffix}: `);
   while (lineQueue.length === 0 && !stdinEof) {
     await new Promise((resolve) => {
       lineWaiter = resolve;
     });
   }
-  const raw = lineQueue.length ? lineQueue.shift() : "";
+  if (stdinEof && lineQueue.length === 0) {
+    return "";
+  }
+  const raw = lineQueue.shift();
   return raw.trim() || defaultValue;
 }
 
-function processHiddenInput(buffer, text) {
-  for (const char of text) {
-    if (char === "\u0003") {
-      return "exit";
-    }
-    if (char === "\r" || char === "\n" || char === "\u0004") {
-      return "finish";
-    }
-    if (char === "\u007f") {
-      buffer.pop();
-      continue;
-    }
-    buffer.push(char);
-  }
-  return "continue";
-}
-
-async function askHidden(question) {
+function askHidden(question) {
   if (!stdin.isTTY) {
     stdout.write("提示：当前为非交互模式（stdin 非 TTY），无法输入隐藏文本（Cookie）。\n");
-    return "";
+    return Promise.resolve("");
+  }
+  ensureInputReader();
+  stdout.write(`${question}: `);
+  if (lineQueue.length > 0) {
+    const value = lineQueue.shift();
+    stdout.write("\n");
+    return Promise.resolve(value.trim());
   }
   return new Promise((resolve) => {
-    stdout.write(`${question}: `);
-    const buffer = [];
-    const onData = (chunk) => {
-      const result = processHiddenInput(buffer, chunk.toString("utf8"));
-      if (result === "exit") {
-        exit(130);
-        return;
-      }
-      if (result === "finish") {
-        stdin.off("data", onData);
-        stdin.setRawMode(false);
-        stdout.write("\n");
-        resolve(buffer.join("").trim());
-      }
-    };
     stdin.setRawMode(true);
-    stdin.resume();
-    stdin.setEncoding("utf8");
-    stdin.on("data", onData);
+    hiddenRead = { buffer: [], resolve };
   });
 }
 
