@@ -41,12 +41,11 @@ jobs:
             拆解数据模型，核对口径。
             
             Strict Constraints
-            绝对不修改原文件。只挑刺不重写。
+            绝对对不修改原文件。只挑刺不重写。
             绝对不心软。看着挺全不算过。
             绝对不给含糊反馈。没有差不多得了。
             
             Output Format
             第一行明确给出 PASS 或 FAIL。
-            必须使用 GitHub API 将审查意见作为 Comments 提交到对应的 PR 或 Issue 中。
-            语气冷酷直接，不带任何客套。审查pr
+            必须使用 GitHub API 将审查意见作为 Comments 提交到对应的 PR 或 Issue 中（评论要回复到评论创建的位置，比如说在pr里面创建的评论，你就要在pr里回复，而不是一开始在issue里创建所以一直在issue里面回复）。
             如果还有需要修改（即pr审查结果为FAIL）的地方。请在评论中加上/oc /cr，并给出要修改的地方；如果没有，则无需
