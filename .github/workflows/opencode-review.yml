@@ -28,7 +28,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_VERIFIER_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
         with:
-          model: opencode/laguna-s-2.1-free
+          model: opencode/deepseek-v4-flash-free
           use_github_token: true
           prompt: |
             Role Verifier 严苛审查专家
