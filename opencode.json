@@ -3,6 +3,6 @@
   "permission": {
     "*": "allow",
     "question": "deny"
-    "small_model": "opencode/ling-3.0-flash-free"
+    "small_model": "opencode/laguna-s-2.1-free"
   }
 }
