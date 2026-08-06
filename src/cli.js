@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const readline = require("node:readline/promises");
+const fs = require("node:fs");
 const { stdin, stdout, exit } = require("node:process");
 const { parseArgs } = require("node:util");
 
@@ -11,6 +11,7 @@ const {
   maskSecret,
   saveConfig
 } = require("./config");
+const { version: APP_VERSION } = require("../package.json");
 const {
   DEFAULT_USER_AGENT,
   buildSongOutputPath,
@@ -38,48 +39,323 @@ function printHelp() {
   --out            覆盖下载目录
   --pattern        文件名模式: artist-title | title-artist | title
   -h, --help       显示帮助
+
+交互模式:
+  直接运行 node src/cli.js 进入交互式菜单
 `);
 }
 
-async function askVisible(question, defaultValue = "") {
-  const rl = readline.createInterface({ input: stdin, output: stdout });
-  const suffix = defaultValue ? ` [${defaultValue}]` : "";
-  const answer = await rl.question(`${question}${suffix}: `);
-  rl.close();
-  return answer.trim() || defaultValue;
+function printMenu() {
+  stdout.write(`
+╔══════════════════════════════════════════════╗
+║       网易云音乐终端版下载工具 v${APP_VERSION}       ║
+╠══════════════════════════════════════════════╣
+║  1. 抓取 Cookie (自动打开浏览器登录)        ║
+║  2. 手动输入配置                             ║
+║  3. 下载歌曲                                 ║
+║  4. 查看配置                                 ║
+║  5. 重置配置                                 ║
+║  0. 退出                                     ║
+╚══════════════════════════════════════════════╝
+`);
 }
 
-async function askHidden(question) {
-  if (!stdin.isTTY) {
+async function handleMenuChoice(choice, config) {
+  switch (choice) {
+    case "1":
+      stdout.write("\n正在启动浏览器抓取 Cookie...\n");
+      try {
+        const cookieStr = await autoCaptureCookie({ headless: false });
+        if (!cookieStr) {
+          throw new Error("未能获取到 Cookie，请重试。");
+        }
+        config.cookie = cookieStr;
+        await saveConfig(config);
+        stdout.write("\nCookie 已保存到本地配置。\n");
+        stdout.write(`Cookie: ${maskSecret(cookieStr)}\n`);
+      } catch (err) {
+        console.error(`抓取 Cookie 失败: ${err.message}`);
+      }
+      return { continue: true, config };
+
+    case "2":
+      config = await setupWizard(config);
+      return { continue: true, config };
+
+    case "3":
+      const targetInput = await askVisible("请输入歌曲 ID 或链接");
+      if (!targetInput) {
+        stdout.write("未输入歌曲 ID 或链接，返回菜单。\n");
+        return { continue: true, config };
+      }
+      if (config.cookie) {
+        stdout.write(`当前 Cookie: ${maskSecret(config.cookie)}\n`);
+        // 非交互模式下不询问 y/n（无法交互应答，且会劫持脚本管道的下一行输入），直接使用当前 Cookie
+        if (stdin.isTTY) {
+          const keepCookie = await askVisible("是否使用当前 Cookie？(y/n)", "y");
+          if (keepCookie.toLowerCase() !== "y") {
+            const newCookie = await askHidden("请粘贴新的网易云网页 Cookie");
+            if (newCookie) {
+              config.cookie = newCookie;
+              await saveConfig(config);
+            } else {
+              stdout.write("未获取到新 Cookie，本次不下载，返回菜单。\n");
+              return { continue: true, config };
+            }
+          }
+        }
+      } else {
+        const pastedCookie = await resolveCookie(config, { cookie: "" });
+        if (pastedCookie) {
+          config.cookie = pastedCookie;
+          await saveConfig(config);
+        }
+      }
+      if (!config.cookie) {
+        stdout.write("缺少 Cookie，无法下载。请先抓取或手动输入 Cookie。\n");
+        return { continue: true, config };
+      }
+      try {
+        await downloadSongFlow(targetInput, config);
+      } catch (err) {
+        console.error(`下载失败: ${err.message}`);
+      }
+      return { continue: true, config };
+
+    case "4":
+      showConfig(config);
+      return { continue: true, config };
+
+    case "5":
+      const confirm = await askVisible("确认重置所有配置？(y/n)", "n");
+      if (confirm.toLowerCase() === "y") {
+        await saveConfig(DEFAULT_CONFIG);
+        config = Object.assign({}, DEFAULT_CONFIG);
+        stdout.write("配置已重置。\n");
+      } else {
+        stdout.write("已取消重置。\n");
+      }
+      return { continue: true, config };
+
+    case "0":
+      stdout.write("再见！\n");
+      return { continue: false, config };
+
+    default:
+      stdout.write("无效的选择，请重新输入。\n");
+      return { continue: true, config };
+  }
+}
+
+function hasMenuInput() {
+  if (stdin.isTTY) {
+    return true;
+  }
+  try {
+    const stat = fs.fstatSync(stdin.fd);
+    // 管道/FIFO/套接字与普通文件均可脚本化驱动菜单（node src/cli.js < menu.txt）；
+    // 仅字符设备（如 /dev/null）与目录视为无输入，保持打印帮助的旧行为
+    return !(stat.isCharacterDevice() || stat.isDirectory());
+  } catch {
+    return false;
+  }
+}
+
+async function interactiveMenu() {
+  let config = await loadConfig();
+  config = mergeRuntimeConfig(config, {
+    cookie: process.env.NCM_COOKIE || "",
+    userAgent: process.env.NCM_USER_AGENT || "",
+    quality: process.env.NCM_QUALITY || "",
+    out: process.env.NCM_DOWNLOAD_DIR || "",
+    pattern: process.env.NCM_FILENAME_PATTERN || ""
+  });
+
+  while (true) {
+    printMenu();
+    const choice = await askVisible("请选择功能 (0-5)");
+    if (stdinEof && !choice) {
+      stdout.write("输入已结束，退出。\n");
+      break;
+    }
+    const result = await handleMenuChoice(choice, config);
+    config = result.config;
+    if (!result.continue) break;
+    stdout.write("\n");
+  }
+  stopInputReader();
+}
+
+function stopInputReader() {
+  if (!inputStarted) {
+    return;
+  }
+  stdin.off("data", onInputData);
+  stdin.off("close", onInputClose);
+  if (stdin.isTTY) {
+    stdin.setRawMode(false);
+  }
+  stdin.pause();
+  inputStarted = false;
+}
+
+let inputStarted = false;
+let stdinEof = false;
+let lineWaiter = null;
+const lineQueue = [];
+let visibleBuffer = "";
+let hiddenRead = null;
+let prevChar = "";
+// hidden 以 \r 结束时置位：跨 chunk 一次性吸收紧随其后的 \n（CRLF 粘贴尾部），
+// 避免 \r 与 \n 拆到不同 data chunk 时产生幽灵空行；仅吸收一个字符，之后新行正常入队
+let pendingHiddenLf = false;
+
+function wakeLineWaiter() {
+  if (lineWaiter) {
+    const wake = lineWaiter;
+    lineWaiter = null;
+    wake();
+  }
+}
+
+function finishHiddenInput(char) {
+  const read = hiddenRead;
+  hiddenRead = null;
+  pendingHiddenLf = char === "\r";
+  prevChar = "";
+  visibleBuffer = "";
+  if (stdin.isTTY) {
+    stdin.setRawMode(false);
+    stdout.write("\n");
+  }
+  read.resolve(read.buffer.join("").trim());
+}
+
+function onInputData(chunk) {
+  const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (hiddenRead) {
+      if (char === "\u0003") {
+        exit(130);
+        return;
+      }
+      if (char === "\u007f" || char === "\b") {
+        hiddenRead.buffer.pop();
+        prevChar = "";
+        continue;
+      }
+      if (char === "\r" || char === "\n" || char === "\u0004") {
+        // 终止符后若同 chunk 内还有非换行内容，说明是多行粘贴（如浏览器 Cookie 面板整块复制）：
+        // 整段拒绝并丢弃剩余内容，避免 Cookie 被截断落盘、剩余行漏入可见队列
+        const rest = text.slice(i + 1);
+        if (char !== "\u0004" && /[^\r\n]/.test(rest)) {
+          const read = hiddenRead;
+          hiddenRead = null;
+          pendingHiddenLf = false;
+          prevChar = "";
+          visibleBuffer = "";
+          if (stdin.isTTY) {
+            stdin.setRawMode(false);
+            stdout.write("\n");
+          }
+          stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
+          read.resolve("");
+          return;
+        }
+        finishHiddenInput(char);
+        if (char !== "\u0004" && rest.length > 0) {
+          // 同 chunk 内紧邻的尾部换行（\r\n 的 \n、尾部空行）属于粘贴内容，直接吸收；
+          // 吸收后无需跨 chunk 的 pendingHiddenLf，避免误吞用户下一次输入
+          pendingHiddenLf = false;
+          i = text.length - 1;
+        }
+        continue;
+      }
+      hiddenRead.buffer.push(char);
+      prevChar = "";
+      continue;
+    }
+    if (pendingHiddenLf) {
+      pendingHiddenLf = false;
+      if (char === "\n") {
+        prevChar = char;
+        continue;
+      }
+    }
+    if (char === "\r" || char === "\n" || char === "\u0004") {
+      if (char === "\n" && prevChar === "\r") {
+        prevChar = char;
+        continue;
+      }
+      lineQueue.push(visibleBuffer);
+      visibleBuffer = "";
+      prevChar = char;
+      wakeLineWaiter();
+      continue;
+    }
+    if (char === "\u007f" || char === "\b") {
+      visibleBuffer = visibleBuffer.slice(0, -1);
+      prevChar = "";
+      continue;
+    }
+    visibleBuffer += char;
+    prevChar = "";
+  }
+}
+
+function ensureInputReader() {
+  if (inputStarted) {
+    return;
+  }
+  inputStarted = true;
+  stdin.setEncoding("utf8");
+  stdin.resume();
+  stdin.on("data", onInputData);
+  stdin.on("close", onInputClose);
+}
+
+function onInputClose() {
+  stdinEof = true;
+  wakeLineWaiter();
+  if (hiddenRead) {
+    const read = hiddenRead;
+    hiddenRead = null;
+    read.resolve(read.buffer.join(""));
+  }
+}
+
+async function askVisible(question, defaultValue = "") {
+  const suffix = defaultValue ? ` [${defaultValue}]` : "";
+  ensureInputReader();
+  stdout.write(`${question}${suffix}: `);
+  while (lineQueue.length === 0 && !stdinEof) {
+    await new Promise((resolve) => {
+      lineWaiter = resolve;
+    });
+  }
+  if (stdinEof && lineQueue.length === 0) {
     return "";
   }
+  const raw = lineQueue.shift();
+  return raw.trim() || defaultValue;
+}
+
+function askHidden(question) {
+  if (!stdin.isTTY) {
+    stdout.write("提示：当前为非交互模式（stdin 非 TTY），无法输入隐藏文本（Cookie）。\n");
+    return Promise.resolve("");
+  }
+  ensureInputReader();
+  stdout.write(`${question}: `);
+  if (lineQueue.length > 0) {
+    const value = lineQueue.shift();
+    stdout.write("\n");
+    return Promise.resolve(value.trim());
+  }
   return new Promise((resolve) => {
-    stdout.write(`${question}: `);
-    const chunks = [];
-    const onData = (chunk) => {
-      const text = chunk.toString("utf8");
-      if (text === "\r" || text === "\n" || text === "\u0004") {
-        stdin.off("data", onData);
-        if (stdin.isTTY) {
-          stdin.setRawMode(false);
-        }
-        stdout.write("\n");
-        resolve(chunks.join("").trim());
-        return;
-      }
-      if (text === "\u0003") {
-        exit(130);
-      }
-      if (text === "\u007f") {
-        chunks.pop();
-        return;
-      }
-      chunks.push(text);
-    };
     stdin.setRawMode(true);
-    stdin.resume();
-    stdin.setEncoding("utf8");
-    stdin.on("data", onData);
+    hiddenRead = { buffer: [], resolve };
   });
 }
 
@@ -109,6 +385,7 @@ async function setupWizard(currentConfig) {
   });
   await saveConfig(nextConfig);
   stdout.write("配置已保存。\n");
+  return nextConfig;
 }
 
 function showConfig(config) {
@@ -159,6 +436,14 @@ async function downloadSongFlow(targetInput, config) {
 }
 
 async function main() {
+  try {
+    await runMain();
+  } finally {
+    stopInputReader();
+  }
+}
+
+async function runMain() {
   const parsed = parseArgs({
     args: process.argv.slice(2),
     options: {
@@ -180,6 +465,17 @@ async function main() {
 
   if (parsed.values.help || command === "help" || command === "-h" || command === "--help") {
     printHelp();
+    return;
+  }
+
+  // 无参数时：TTY、管道或文件重定向（脚本化驱动菜单）才进入交互菜单，
+  // 否则保持旧行为打印帮助，避免在 CI / cron 等非交互环境悬空退出
+  if (positionals.length === 0 && !parsed.values.cookie && !parsed.values["user-agent"] && !parsed.values.quality && !parsed.values.out && !parsed.values.pattern) {
+    if (hasMenuInput()) {
+      await interactiveMenu();
+    } else {
+      printHelp();
+    }
     return;
   }
 
