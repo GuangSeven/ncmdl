@@ -6,6 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const CLI_PATH = path.join(__dirname, "..", "src", "cli.js");
+const { processHiddenInput } = require("../src/cli");
 
 const WINDOWS_SKIP =
   "Windows 匿名管道经 fs.fstatSync 无法识别为可交互输入，脚本化菜单测试不适用";
@@ -104,6 +105,45 @@ test("下载选项缺少 Cookie 时中止且不发起网络请求", { skip: proc
   const { code, stdout } = await runCli([], { input: "3\n12345\n0\n", home });
   assert.equal(code, 0);
   assert.match(stdout, /缺少 Cookie，无法下载。/);
+  assert.doesNotMatch(stdout, /下载失败/, "不应尝试真实下载");
+  assert.match(stdout, /再见！/);
+});
+
+test("askHidden 粘贴内容与换行符同 chunk 到达时应正确终止（修复死锁）", () => {
+  const buffer = [];
+  const result = processHiddenInput(buffer, "MUSIC_U=PASTE\n");
+  assert.equal(result, "finish");
+  assert.equal(buffer.join(""), "MUSIC_U=PASTE");
+});
+
+test("askHidden 多 chunk 累积输入后由独立换行终止", () => {
+  const buffer = [];
+  assert.equal(processHiddenInput(buffer, "MUSIC_U=PA"), "continue");
+  assert.equal(processHiddenInput(buffer, "STE"), "continue");
+  assert.equal(processHiddenInput(buffer, "\r"), "finish");
+  assert.equal(buffer.join(""), "MUSIC_U=PASTE");
+});
+
+test("askHidden 处理退格删除前一字符", () => {
+  const buffer = [];
+  assert.equal(processHiddenInput(buffer, "MUSIC_U=abcd\u007f"), "continue");
+  assert.equal(processHiddenInput(buffer, "\r"), "finish");
+  assert.equal(buffer.join(""), "MUSIC_U=abc");
+});
+
+test("askHidden 检测到 Ctrl+C 应退出", () => {
+  const buffer = [];
+  assert.equal(processHiddenInput(buffer, "MUSIC_U=ab\u0003"), "exit");
+});
+
+test("非 TTY 下放弃当前 Cookie 时明确提示且不静默继续下载", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "3\n12345\nn\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /非交互模式.*无法输入隐藏文本/, "应提示非交互模式无法输入 Cookie");
+  assert.match(stdout, /未获取到新 Cookie，本次不下载/, "应明确放弃下载而非用旧 Cookie 静默继续");
   assert.doesNotMatch(stdout, /下载失败/, "不应尝试真实下载");
   assert.match(stdout, /再见！/);
 });

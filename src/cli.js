@@ -97,6 +97,9 @@ async function handleMenuChoice(choice, config) {
           if (newCookie) {
             config.cookie = newCookie;
             await saveConfig(config);
+          } else {
+            stdout.write("未获取到新 Cookie，本次不下载，返回菜单。\n");
+            return { continue: true, config };
           }
         }
       } else {
@@ -176,7 +179,31 @@ async function interactiveMenu() {
 
 let persistentRl = null;
 let stdinEof = false;
+let lineWaiter = null;
 const lineQueue = [];
+
+function ensurePersistentRl() {
+  if (persistentRl) {
+    return;
+  }
+  persistentRl = readline.createInterface({ input: stdin });
+  persistentRl.on("line", (line) => {
+    lineQueue.push(line);
+    if (lineWaiter) {
+      const wake = lineWaiter;
+      lineWaiter = null;
+      wake();
+    }
+  });
+  persistentRl.on("close", () => {
+    stdinEof = true;
+    if (lineWaiter) {
+      const wake = lineWaiter;
+      lineWaiter = null;
+      wake();
+    }
+  });
+}
 
 async function askVisible(question, defaultValue = "") {
   const suffix = defaultValue ? ` [${defaultValue}]` : "";
@@ -186,52 +213,57 @@ async function askVisible(question, defaultValue = "") {
     rl.close();
     return answer.trim() || defaultValue;
   }
-  if (!persistentRl) {
-    persistentRl = readline.createInterface({ input: stdin });
-    persistentRl.on("line", (line) => {
-      lineQueue.push(line);
-    });
-    persistentRl.on("close", () => {
-      stdinEof = true;
-    });
-  }
+  ensurePersistentRl();
   if (stdinEof && lineQueue.length === 0) {
     return "";
   }
   stdout.write(`${question}${suffix}: `);
   while (lineQueue.length === 0 && !stdinEof) {
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => {
+      lineWaiter = resolve;
+    });
   }
   const raw = lineQueue.length ? lineQueue.shift() : "";
   return raw.trim() || defaultValue;
 }
 
+function processHiddenInput(buffer, text) {
+  for (const char of text) {
+    if (char === "\u0003") {
+      return "exit";
+    }
+    if (char === "\r" || char === "\n" || char === "\u0004") {
+      return "finish";
+    }
+    if (char === "\u007f") {
+      buffer.pop();
+      continue;
+    }
+    buffer.push(char);
+  }
+  return "continue";
+}
+
 async function askHidden(question) {
   if (!stdin.isTTY) {
+    stdout.write("提示：当前为非交互模式（stdin 非 TTY），无法输入隐藏文本（Cookie）。\n");
     return "";
   }
   return new Promise((resolve) => {
     stdout.write(`${question}: `);
-    const chunks = [];
+    const buffer = [];
     const onData = (chunk) => {
-      const text = chunk.toString("utf8");
-      if (text === "\r" || text === "\n" || text === "\u0004") {
-        stdin.off("data", onData);
-        if (stdin.isTTY) {
-          stdin.setRawMode(false);
-        }
-        stdout.write("\n");
-        resolve(chunks.join("").trim());
-        return;
-      }
-      if (text === "\u0003") {
+      const result = processHiddenInput(buffer, chunk.toString("utf8"));
+      if (result === "exit") {
         exit(130);
-      }
-      if (text === "\u007f") {
-        chunks.pop();
         return;
       }
-      chunks.push(text);
+      if (result === "finish") {
+        stdin.off("data", onData);
+        stdin.setRawMode(false);
+        stdout.write("\n");
+        resolve(buffer.join("").trim());
+      }
     };
     stdin.setRawMode(true);
     stdin.resume();
@@ -430,4 +462,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, processHiddenInput };
