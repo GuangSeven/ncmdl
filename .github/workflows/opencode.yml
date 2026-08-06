@@ -5,6 +5,15 @@ on:
     types: [created]
   pull_request_review_comment:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Command to run: cr or vr"
+        required: true
+        type: choice
+        options:
+          - cr
+          - vr
 
 jobs:
   verifier:
@@ -13,10 +22,17 @@ jobs:
       group: opencode-verifier-${{ github.ref }}
       cancel-in-progress: true
     if: |
-      contains(github.event.comment.body, ' /vr') ||
-      startsWith(github.event.comment.body, '/vr') ||
-      contains(github.event.comment.body, ' /verifier') ||
-      startsWith(github.event.comment.body, '/verifier')
+      (
+        github.event_name == 'workflow_dispatch' &&
+        inputs.command == 'vr'
+      ) || (
+        github.event_name != 'workflow_dispatch' && (
+          contains(github.event.comment.body, ' /vr') ||
+          startsWith(github.event.comment.body, '/vr') ||
+          contains(github.event.comment.body, ' /verifier') ||
+          startsWith(github.event.comment.body, '/verifier')
+        )
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -58,14 +74,13 @@ jobs:
             拆解数据模型，核对口径。
             
             Strict Constraints
-            绝对不修改原文件。只挑刺不重写。
+            绝对对不修改原文件。只挑刺不重写。
             绝对不心软。看着挺全不算过。
             绝对不给含糊反馈。没有差不多得了。
             
             Output Format
             第一行明确给出 PASS 或 FAIL。
-            必须使用 GitHub API 将审查意见作为 Comments 提交到对应的 PR 或 Issue 中。
-            语气冷酷直接，不带任何客套。审查pr
+            必须使用 GitHub API 将审查意见作为 Comments 提交到对应的 PR 或 Issue 中（评论要回复到评论创建的位置，比如说在pr里面创建的评论，你就要在pr里回复，而不是一开始在issue里创建所以一直在issue里面回复）。
 
   coder:
     timeout-minutes: 60
@@ -73,10 +88,17 @@ jobs:
       group: opencode-coder-${{ github.ref }}
       cancel-in-progress: true
     if: |
-      contains(github.event.comment.body, ' /cr') ||
-      startsWith(github.event.comment.body, '/cr') ||
-      contains(github.event.comment.body, ' /coder') ||
-      startsWith(github.event.comment.body, '/coder')
+      (
+        github.event_name == 'workflow_dispatch' &&
+        inputs.command == 'cr'
+      ) || (
+        github.event_name != 'workflow_dispatch' && (
+          contains(github.event.comment.body, ' /cr') ||
+          startsWith(github.event.comment.body, '/cr') ||
+          contains(github.event.comment.body, ' /coder') ||
+          startsWith(github.event.comment.body, '/coder')
+        )
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
