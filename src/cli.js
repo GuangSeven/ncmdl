@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+const fs = require("node:fs");
 const readline = require("node:readline/promises");
 const { stdin, stdout, exit } = require("node:process");
 const { parseArgs } = require("node:util");
@@ -95,6 +96,7 @@ async function handleMenuChoice(choice, config) {
           const newCookie = await askHidden("请粘贴新的网易云网页 Cookie");
           if (newCookie) {
             config.cookie = newCookie;
+            await saveConfig(config);
           }
         }
       } else {
@@ -136,6 +138,18 @@ async function handleMenuChoice(choice, config) {
   }
 }
 
+function hasInteractiveStdin() {
+  if (stdin.isTTY) {
+    return true;
+  }
+  try {
+    const stat = fs.fstatSync(stdin.fd);
+    return !(stat.isCharacterDevice() || stat.isFile() || stat.isDirectory());
+  } catch {
+    return false;
+  }
+}
+
 async function interactiveMenu() {
   let config = await loadConfig();
   config = mergeRuntimeConfig(config, {
@@ -149,6 +163,10 @@ async function interactiveMenu() {
   while (true) {
     printMenu();
     const choice = await askVisible("请选择功能 (0-5)");
+    if (stdinEof && !choice) {
+      stdout.write("输入已结束，退出。\n");
+      break;
+    }
     const result = await handleMenuChoice(choice, config);
     config = result.config;
     if (!result.continue) break;
@@ -156,12 +174,36 @@ async function interactiveMenu() {
   }
 }
 
+let persistentRl = null;
+let stdinEof = false;
+const lineQueue = [];
+
 async function askVisible(question, defaultValue = "") {
-  const rl = readline.createInterface({ input: stdin, output: stdout });
   const suffix = defaultValue ? ` [${defaultValue}]` : "";
-  const answer = await rl.question(`${question}${suffix}: `);
-  rl.close();
-  return answer.trim() || defaultValue;
+  if (stdin.isTTY) {
+    const rl = readline.createInterface({ input: stdin, output: stdout });
+    const answer = await rl.question(`${question}${suffix}: `);
+    rl.close();
+    return answer.trim() || defaultValue;
+  }
+  if (!persistentRl) {
+    persistentRl = readline.createInterface({ input: stdin });
+    persistentRl.on("line", (line) => {
+      lineQueue.push(line);
+    });
+    persistentRl.on("close", () => {
+      stdinEof = true;
+    });
+  }
+  if (stdinEof && lineQueue.length === 0) {
+    return "";
+  }
+  stdout.write(`${question}${suffix}: `);
+  while (lineQueue.length === 0 && !stdinEof) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const raw = lineQueue.length ? lineQueue.shift() : "";
+  return raw.trim() || defaultValue;
 }
 
 async function askHidden(question) {
@@ -299,9 +341,14 @@ async function main() {
     return;
   }
 
-  // 如果没有提供任何参数，进入交互式菜单
+  // 无参数时：TTY 或管道输入（脚本化驱动菜单）才进入交互菜单，
+  // 否则保持旧行为打印帮助，避免在 CI / cron 等非交互环境悬空退出
   if (positionals.length === 0 && !parsed.values.cookie && !parsed.values["user-agent"] && !parsed.values.quality && !parsed.values.out && !parsed.values.pattern) {
-    await interactiveMenu();
+    if (hasInteractiveStdin()) {
+      await interactiveMenu();
+    } else {
+      printHelp();
+    }
     return;
   }
 
