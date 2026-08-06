@@ -6,7 +6,6 @@ const path = require("node:path");
 const test = require("node:test");
 
 const CLI_PATH = path.join(__dirname, "..", "src", "cli.js");
-const { processHiddenInput } = require("../src/cli");
 
 const WINDOWS_SKIP =
   "Windows 匿名管道经 fs.fstatSync 无法识别为可交互输入，脚本化菜单测试不适用";
@@ -163,43 +162,16 @@ test("下载选项缺少 Cookie 时中止且不发起网络请求", { skip: proc
   assert.match(stdout, /再见！/);
 });
 
-test("askHidden 粘贴内容与换行符同 chunk 到达时应正确终止（修复死锁）", () => {
-  const buffer = [];
-  const result = processHiddenInput(buffer, "MUSIC_U=PASTE\n");
-  assert.equal(result, "finish");
-  assert.equal(buffer.join(""), "MUSIC_U=PASTE");
-});
-
-test("askHidden 多 chunk 累积输入后由独立换行终止", () => {
-  const buffer = [];
-  assert.equal(processHiddenInput(buffer, "MUSIC_U=PA"), "continue");
-  assert.equal(processHiddenInput(buffer, "STE"), "continue");
-  assert.equal(processHiddenInput(buffer, "\r"), "finish");
-  assert.equal(buffer.join(""), "MUSIC_U=PASTE");
-});
-
-test("askHidden 处理退格删除前一字符", () => {
-  const buffer = [];
-  assert.equal(processHiddenInput(buffer, "MUSIC_U=abcd\u007f"), "continue");
-  assert.equal(processHiddenInput(buffer, "\r"), "finish");
-  assert.equal(buffer.join(""), "MUSIC_U=abc");
-});
-
-test("askHidden 检测到 Ctrl+C 应退出", () => {
-  const buffer = [];
-  assert.equal(processHiddenInput(buffer, "MUSIC_U=ab\u0003"), "exit");
-});
-
-test("非 TTY 下放弃当前 Cookie 时明确提示且不静默继续下载", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+test("管道驱动：已配置 Cookie 时选项 3 不询问 y/n，退出选项不被劫持（修复前被 keep-cookie 提示吞掉）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
   const home = makeTempHome("MUSIC_U=old-cookie");
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
 
-  const { code, stdout } = await runCli([], { input: "3\n12345\nn\n0\n", home });
+  const { code, stdout, stderr } = await runCli([], { input: "3\nabc\n0\n", home });
   assert.equal(code, 0);
-  assert.match(stdout, /非交互模式.*无法输入隐藏文本/, "应提示非交互模式无法输入 Cookie");
-  assert.match(stdout, /未获取到新 Cookie，本次不下载/, "应明确放弃下载而非用旧 Cookie 静默继续");
-  assert.doesNotMatch(stdout, /下载失败/, "不应尝试真实下载");
-  assert.match(stdout, /再见！/);
+  assert.match(stdout, /当前 Cookie:/, "应展示当前 Cookie");
+  assert.match(stderr, /下载失败: 请输入有效的歌曲 ID/, "应使用现有 Cookie 直接进入下载流程（网络前的确定性失败）");
+  assert.match(stdout, /再见！/, "选项 0（退出）不应被 y/n 提示劫持");
+  assert.doesNotMatch(stdout + stderr, /非交互模式|未获取到新 Cookie/, "非 TTY 下不应出现 keep-cookie 询问");
 });
 
 test("TTY：连续选择在同一次输入 chunk 中逐条消费（修复 burst 死锁）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
@@ -226,7 +198,7 @@ test("TTY：hidden 粘贴（含 CR）与换行同 chunk 到达时正确保存并
     env: { HOME: home },
     steps: [
       { trigger: "请选择功能", send: "3\n" },
-      { trigger: "请输入歌曲 ID", send: "12345\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
       { trigger: "是否使用当前 Cookie", send: "n\n" },
       { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PASTE\r" },
       { trigger: "下载失败", send: "0\n" },
@@ -250,7 +222,7 @@ test("TTY：hidden 粘贴以 LF 结尾时正确终止", { skip: !PTY_AVAILABLE ?
     env: { HOME: home },
     steps: [
       { trigger: "请选择功能", send: "3\n" },
-      { trigger: "请输入歌曲 ID", send: "12345\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
       { trigger: "是否使用当前 Cookie", send: "n\n" },
       { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PASTE\n" },
       { trigger: "下载失败", send: "0\n" },
@@ -265,6 +237,56 @@ test("TTY：hidden 粘贴以 LF 结尾时正确终止", { skip: !PTY_AVAILABLE ?
   assert.match(stdout, /再见！/);
 });
 
+test("TTY：hidden 粘贴以 CRLF 结尾时不产生幽灵空行（修复前菜单多跳一次无效选择）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PASTE\r\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=PASTE", "config.json 应写入粘贴的 Cookie");
+  assert.doesNotMatch(stdout, /无效的选择/, "CRLF 粘贴不应产生幽灵空行");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：hidden 输入多 chunk 累积后正确终止", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PA" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "STE\r" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=PASTE", "多 chunk 累积输入应完整保存");
+  assert.match(stdout, /再见！/);
+});
+
 test("TTY：hidden 输入支持退格删除", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
   const home = makeTempHome("MUSIC_U=old-cookie");
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -274,7 +296,7 @@ test("TTY：hidden 输入支持退格删除", { skip: !PTY_AVAILABLE ? PTY_SKIP 
     env: { HOME: home },
     steps: [
       { trigger: "请选择功能", send: "3\n" },
-      { trigger: "请输入歌曲 ID", send: "12345\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
       { trigger: "是否使用当前 Cookie", send: "n\n" },
       { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PASTEX\x7f\r" },
       { trigger: "下载失败", send: "0\n" },
@@ -298,7 +320,7 @@ test("TTY：raw-mode hidden 输入中 Ctrl+C 退出并返回 130", { skip: !PTY_
     env: { HOME: home },
     steps: [
       { trigger: "请选择功能", send: "3\n" },
-      { trigger: "请输入歌曲 ID", send: "12345\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
       { trigger: "是否使用当前 Cookie", send: "n\n" },
       { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=AB\u0003" },
     ],

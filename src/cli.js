@@ -90,15 +90,18 @@ async function handleMenuChoice(choice, config) {
       }
       if (config.cookie) {
         stdout.write(`当前 Cookie: ${maskSecret(config.cookie)}\n`);
-        const keepCookie = await askVisible("是否使用当前 Cookie？(y/n)", "y");
-        if (keepCookie.toLowerCase() !== "y") {
-          const newCookie = await askHidden("请粘贴新的网易云网页 Cookie");
-          if (newCookie) {
-            config.cookie = newCookie;
-            await saveConfig(config);
-          } else {
-            stdout.write("未获取到新 Cookie，本次不下载，返回菜单。\n");
-            return { continue: true, config };
+        // 非交互模式下不询问 y/n（无法交互应答，且会劫持脚本管道的下一行输入），直接使用当前 Cookie
+        if (stdin.isTTY) {
+          const keepCookie = await askVisible("是否使用当前 Cookie？(y/n)", "y");
+          if (keepCookie.toLowerCase() !== "y") {
+            const newCookie = await askHidden("请粘贴新的网易云网页 Cookie");
+            if (newCookie) {
+              config.cookie = newCookie;
+              await saveConfig(config);
+            } else {
+              stdout.write("未获取到新 Cookie，本次不下载，返回菜单。\n");
+              return { continue: true, config };
+            }
           }
         }
       } else {
@@ -197,6 +200,7 @@ const lineQueue = [];
 let visibleBuffer = "";
 let hiddenRead = null;
 let prevChar = "";
+let suppressNextLine = false;
 
 function wakeLineWaiter() {
   if (lineWaiter) {
@@ -218,17 +222,6 @@ function handleHiddenChar(state, char) {
     return "continue";
   }
   state.buffer.push(char);
-  return "continue";
-}
-
-function processHiddenInput(buffer, text) {
-  const state = { buffer };
-  for (const char of text) {
-    const result = handleHiddenChar(state, char);
-    if (result !== "continue") {
-      return result;
-    }
-  }
   return "continue";
 }
 
@@ -266,6 +259,9 @@ function onInputData(chunk) {
       if (result === "finish") {
         const read = hiddenRead;
         hiddenRead = null;
+        suppressNextLine = true;
+        prevChar = "";
+        visibleBuffer = "";
         if (stdin.isTTY) {
           stdin.setRawMode(false);
           stdout.write("\n");
@@ -275,6 +271,11 @@ function onInputData(chunk) {
       continue;
     }
     if (char === "\r" || char === "\n" || char === "\u0004") {
+      if (suppressNextLine && char !== "\u0004") {
+        prevChar = char;
+        continue;
+      }
+      suppressNextLine = false;
       if (char === "\n" && prevChar === "\r") {
         prevChar = char;
         continue;
@@ -292,6 +293,7 @@ function onInputData(chunk) {
     }
     visibleBuffer += char;
     prevChar = "";
+    suppressNextLine = false;
   }
 }
 
@@ -519,4 +521,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, processHiddenInput };
+module.exports = { main };
