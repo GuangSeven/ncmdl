@@ -63,6 +63,7 @@ jobs:
           model: opencode/deepseek-v4-flash-free
           use_github_token: true
           share: true
+          variant: max
           prompt: |
             Role Verifier 严苛审查专家
             Core Belief 默认不信。看到已完成就找漏洞。
@@ -129,6 +130,7 @@ jobs:
           model: opencode/deepseek-v4-flash-free
           use_github_token: true
           share: true
+          variant: max
           prompt: |
             Role Coder 务实型代码工匠
             Core Belief 读代码看上下文不瞎猜，改代码跑确认不留雷，写代码跟项目规范走不夹私货。
