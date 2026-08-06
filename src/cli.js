@@ -105,7 +105,11 @@ async function handleMenuChoice(choice, config) {
           }
         }
       } else {
-        config.cookie = await resolveCookie(config, { cookie: "" });
+        const pastedCookie = await resolveCookie(config, { cookie: "" });
+        if (pastedCookie) {
+          config.cookie = pastedCookie;
+          await saveConfig(config);
+        }
       }
       if (!config.cookie) {
         stdout.write("缺少 Cookie，无法下载。请先抓取或手动输入 Cookie。\n");
@@ -143,13 +147,15 @@ async function handleMenuChoice(choice, config) {
   }
 }
 
-function hasInteractiveStdin() {
+function hasMenuInput() {
   if (stdin.isTTY) {
     return true;
   }
   try {
     const stat = fs.fstatSync(stdin.fd);
-    return !(stat.isCharacterDevice() || stat.isFile() || stat.isDirectory());
+    // 管道/FIFO/套接字与普通文件均可脚本化驱动菜单（node src/cli.js < menu.txt）；
+    // 仅字符设备（如 /dev/null）与目录视为无输入，保持打印帮助的旧行为
+    return !(stat.isCharacterDevice() || stat.isDirectory());
   } catch {
     return false;
   }
@@ -212,40 +218,17 @@ function wakeLineWaiter() {
   }
 }
 
-function handleHiddenChar(state, char) {
-  if (char === "\u0003") {
-    return "exit";
+function finishHiddenInput(char) {
+  const read = hiddenRead;
+  hiddenRead = null;
+  pendingHiddenLf = char === "\r";
+  prevChar = "";
+  visibleBuffer = "";
+  if (stdin.isTTY) {
+    stdin.setRawMode(false);
+    stdout.write("\n");
   }
-  if (char === "\r" || char === "\n" || char === "\u0004") {
-    return "finish";
-  }
-  if (char === "\u007f" || char === "\b") {
-    state.buffer.pop();
-    return "continue";
-  }
-  state.buffer.push(char);
-  return "continue";
-}
-
-function ensureInputReader() {
-  if (inputStarted) {
-    return;
-  }
-  inputStarted = true;
-  stdin.setEncoding("utf8");
-  stdin.resume();
-  stdin.on("data", onInputData);
-  stdin.on("close", onInputClose);
-}
-
-function onInputClose() {
-  stdinEof = true;
-  wakeLineWaiter();
-  if (hiddenRead) {
-    const read = hiddenRead;
-    hiddenRead = null;
-    read.resolve(read.buffer.join(""));
-  }
+  read.resolve(read.buffer.join("").trim());
 }
 
 function onInputData(chunk) {
@@ -253,23 +236,44 @@ function onInputData(chunk) {
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
     if (hiddenRead) {
-      const result = handleHiddenChar(hiddenRead, char);
-      if (result === "exit") {
+      if (char === "\u0003") {
         exit(130);
         return;
       }
-      if (result === "finish") {
-        const read = hiddenRead;
-        hiddenRead = null;
-        pendingHiddenLf = char === "\r";
+      if (char === "\u007f" || char === "\b") {
+        hiddenRead.buffer.pop();
         prevChar = "";
-        visibleBuffer = "";
-        if (stdin.isTTY) {
-          stdin.setRawMode(false);
-          stdout.write("\n");
-        }
-        read.resolve(read.buffer.join("").trim());
+        continue;
       }
+      if (char === "\r" || char === "\n" || char === "\u0004") {
+        // 终止符后若同 chunk 内还有非换行内容，说明是多行粘贴（如浏览器 Cookie 面板整块复制）：
+        // 整段拒绝并丢弃剩余内容，避免 Cookie 被截断落盘、剩余行漏入可见队列
+        const rest = text.slice(i + 1);
+        if (char !== "\u0004" && /[^\r\n]/.test(rest)) {
+          const read = hiddenRead;
+          hiddenRead = null;
+          pendingHiddenLf = false;
+          prevChar = "";
+          visibleBuffer = "";
+          if (stdin.isTTY) {
+            stdin.setRawMode(false);
+            stdout.write("\n");
+          }
+          stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
+          read.resolve("");
+          return;
+        }
+        finishHiddenInput(char);
+        if (char !== "\u0004" && rest.length > 0) {
+          // 同 chunk 内紧邻的尾部换行（\r\n 的 \n、尾部空行）属于粘贴内容，直接吸收；
+          // 吸收后无需跨 chunk 的 pendingHiddenLf，避免误吞用户下一次输入
+          pendingHiddenLf = false;
+          i = text.length - 1;
+        }
+        continue;
+      }
+      hiddenRead.buffer.push(char);
+      prevChar = "";
       continue;
     }
     if (pendingHiddenLf) {
@@ -297,6 +301,27 @@ function onInputData(chunk) {
     }
     visibleBuffer += char;
     prevChar = "";
+  }
+}
+
+function ensureInputReader() {
+  if (inputStarted) {
+    return;
+  }
+  inputStarted = true;
+  stdin.setEncoding("utf8");
+  stdin.resume();
+  stdin.on("data", onInputData);
+  stdin.on("close", onInputClose);
+}
+
+function onInputClose() {
+  stdinEof = true;
+  wakeLineWaiter();
+  if (hiddenRead) {
+    const read = hiddenRead;
+    hiddenRead = null;
+    read.resolve(read.buffer.join(""));
   }
 }
 
@@ -443,10 +468,10 @@ async function runMain() {
     return;
   }
 
-  // 无参数时：TTY 或管道输入（脚本化驱动菜单）才进入交互菜单，
+  // 无参数时：TTY、管道或文件重定向（脚本化驱动菜单）才进入交互菜单，
   // 否则保持旧行为打印帮助，避免在 CI / cron 等非交互环境悬空退出
   if (positionals.length === 0 && !parsed.values.cookie && !parsed.values["user-agent"] && !parsed.values.quality && !parsed.values.out && !parsed.values.pattern) {
-    if (hasInteractiveStdin()) {
+    if (hasMenuInput()) {
       await interactiveMenu();
     } else {
       printHelp();

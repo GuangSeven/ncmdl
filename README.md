@@ -54,8 +54,8 @@ node src/cli.js config show
 
 菜单支持终端与脚本两种输入方式：
 
-- 终端（TTY）下按提示操作即可，Cookie 输入支持直接粘贴。
-- 脚本/管道输入时逐行喂入选项即可，例如 `printf "4\n0\n" | node src/cli.js`；此时下载不会再询问是否更换 Cookie，直接使用现有配置。
+- 终端（TTY）下按提示操作即可，Cookie 输入支持直接粘贴（需为单行文本，多行粘贴会被拒绝并提示重新粘贴）。
+- 脚本/管道/文件重定向输入时逐行喂入选项即可，例如 `printf "4\n0\n" | node src/cli.js` 或 `node src/cli.js < menu.txt`；此时下载不会再询问是否更换 Cookie，直接使用现有配置。
 
 ## 交互方式
 
