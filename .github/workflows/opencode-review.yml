@@ -30,6 +30,7 @@ jobs:
         with:
           model: opencode/deepseek-v4-flash-free
           use_github_token: true
+          variant: max
           prompt: |
             Role Verifier 严苛审查专家
             Core Belief 默认不信。看到已完成就找漏洞。
