@@ -248,6 +248,9 @@ function onInputClose() {
 
 function onInputData(chunk) {
   const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  if (suppressNextLine) {
+    suppressNextLine = false;
+  }
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
     if (hiddenRead) {
@@ -408,6 +411,14 @@ async function downloadSongFlow(targetInput, config) {
 }
 
 async function main() {
+  try {
+    await runMain();
+  } finally {
+    stopInputReader();
+  }
+}
+
+async function runMain() {
   const parsed = parseArgs({
     args: process.argv.slice(2),
     options: {

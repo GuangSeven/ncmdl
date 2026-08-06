@@ -342,3 +342,60 @@ test("TTY：EOF 时提示输入已结束并退出", { skip: !PTY_AVAILABLE ? PTY
   assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
   assert.match(stdout, /输入已结束，退出。/);
 });
+
+test("TTY：菜单 2 向导粘贴 CRLF Cookie 后纯 Enter 逐项接受默认值（回归：suppressNextLine 粘滞吞行死锁）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "MUSIC_U=SETUP\r\n" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "\n" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `向导应完成并正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=SETUP", "粘贴的 Cookie 应写入配置");
+  assert.equal(config.userAgent, "UA-test", "纯 Enter 应接受默认 User-Agent");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("TTY：download 无 ID 手动输入后失败并正常退出（回归：stdin 常驻导致进程永不退出）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH, "download"],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请输入歌曲 ID 或链接", send: "abc\n" },
+    ],
+    done: "错误: 请输入有效的歌曲",
+  });
+  assert.equal(exitCode, 1, `失败后应退出（修复前挂死需 SIGKILL），实际 exitCode=${exitCode}\n${stdout}`);
+});
+
+test("TTY：download 无 Cookie 时粘贴 Cookie 后失败并正常退出（回归：askHidden 出口不清理 stdin）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH, "download", "abc"],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请粘贴网易云网页 Cookie", send: "MUSIC_U=NEW\r\n" },
+    ],
+    done: "错误: 请输入有效的歌曲",
+  });
+  assert.equal(exitCode, 1, `失败后应退出（修复前挂死需 SIGKILL），实际 exitCode=${exitCode}\n${stdout}`);
+});
