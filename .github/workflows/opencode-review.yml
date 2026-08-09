@@ -26,7 +26,7 @@ jobs:
       - uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_VERIFIER_API_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.VERIFIER_PAT }}
         with:
           model: opencode/deepseek-v4-flash-free
           use_github_token: true
