@@ -206,9 +206,12 @@ const lineQueue = [];
 let visibleBuffer = "";
 let hiddenRead = null;
 let prevChar = "";
-// hidden 以 \r 结束时置位：跨 chunk 一次性吸收紧随其后的 \n（CRLF 粘贴尾部），
-// 避免 \r 与 \n 拆到不同 data chunk 时产生幽灵空行；仅吸收一个字符，之后新行正常入队
-let pendingHiddenLf = false;
+// hidden 输入以"静默"判定结束：粘贴内容常按任意字节边界拆成多个 data chunk 到达，
+// 若按首个换行符终止，多行粘贴会被截断、尾随换行会漏入可见队列。捕获期间持续重置
+// 400ms 计时器，无新数据即视为输入完成；期间所有字节（含 \r\n）都收进缓冲区，
+// 因此粘贴是否跨 chunk 不影响结果，也不会有任何标记残留到可见路径
+const HIDDEN_DEBOUNCE_MS = 400;
+let hiddenDebounce = null;
 
 function wakeLineWaiter() {
   if (lineWaiter) {
@@ -218,17 +221,35 @@ function wakeLineWaiter() {
   }
 }
 
-function finishHiddenInput(char) {
+function resolveHiddenInput() {
+  if (hiddenDebounce) {
+    clearTimeout(hiddenDebounce);
+    hiddenDebounce = null;
+  }
   const read = hiddenRead;
   hiddenRead = null;
-  pendingHiddenLf = char === "\r";
   prevChar = "";
   visibleBuffer = "";
   if (stdin.isTTY) {
-    stdin.setRawMode(false);
+    try {
+      stdin.setRawMode(false);
+    } catch {
+      // 流已关闭（如 EOF 触发 resolve）时 setRawMode 可能抛错，忽略
+    }
     stdout.write("\n");
   }
-  read.resolve(read.buffer.join("").trim());
+  const lines = read.buffer
+    .join("")
+    .replace(/\r\n/g, "\n")
+    .split(/[\r\n]+/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length > 1) {
+    stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
+    read.resolve(null);
+    return;
+  }
+  read.resolve(lines.length === 1 ? lines[0] : "");
 }
 
 function onInputData(chunk) {
@@ -242,46 +263,16 @@ function onInputData(chunk) {
       }
       if (char === "\u007f" || char === "\b") {
         hiddenRead.buffer.pop();
-        prevChar = "";
         continue;
       }
-      if (char === "\r" || char === "\n" || char === "\u0004") {
-        // 终止符后若同 chunk 内还有非换行内容，说明是多行粘贴（如浏览器 Cookie 面板整块复制）：
-        // 整段拒绝并丢弃剩余内容，避免 Cookie 被截断落盘、剩余行漏入可见队列
-        const rest = text.slice(i + 1);
-        if (char !== "\u0004" && /[^\r\n]/.test(rest)) {
-          const read = hiddenRead;
-          hiddenRead = null;
-          pendingHiddenLf = false;
-          prevChar = "";
-          visibleBuffer = "";
-          if (stdin.isTTY) {
-            stdin.setRawMode(false);
-            stdout.write("\n");
-          }
-          stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
-          read.resolve("");
-          return;
-        }
-        finishHiddenInput(char);
-        if (char !== "\u0004" && rest.length > 0) {
-          // 同 chunk 内紧邻的尾部换行（\r\n 的 \n、尾部空行）属于粘贴内容，直接吸收；
-          // 吸收后无需跨 chunk 的 pendingHiddenLf，避免误吞用户下一次输入
-          pendingHiddenLf = false;
-          i = text.length - 1;
-        }
-        continue;
+      if (char === "\u0004") {
+        resolveHiddenInput();
+        return;
       }
       hiddenRead.buffer.push(char);
-      prevChar = "";
+      clearTimeout(hiddenDebounce);
+      hiddenDebounce = setTimeout(resolveHiddenInput, HIDDEN_DEBOUNCE_MS);
       continue;
-    }
-    if (pendingHiddenLf) {
-      pendingHiddenLf = false;
-      if (char === "\n") {
-        prevChar = char;
-        continue;
-      }
     }
     if (char === "\r" || char === "\n" || char === "\u0004") {
       if (char === "\n" && prevChar === "\r") {
@@ -319,9 +310,7 @@ function onInputClose() {
   stdinEof = true;
   wakeLineWaiter();
   if (hiddenRead) {
-    const read = hiddenRead;
-    hiddenRead = null;
-    read.resolve(read.buffer.join(""));
+    resolveHiddenInput();
   }
 }
 
@@ -371,7 +360,11 @@ function mergeRuntimeConfig(baseConfig, values) {
 
 async function setupWizard(currentConfig) {
   stdout.write("本地配置向导会把信息保存到 ~/.ncmdl/config.json\n");
-  const cookie = await askHidden("请输入网易云网页 Cookie");
+  let cookie = await askHidden("请输入网易云网页 Cookie");
+  while (cookie === null) {
+    // 多行粘贴被拒绝（resolve null）时重新提示，不得静默沿用旧 Cookie
+    cookie = await askHidden("请输入网易云网页 Cookie");
+  }
   const userAgent = await askVisible("请输入 User-Agent", currentConfig.userAgent || DEFAULT_USER_AGENT);
   const downloadDir = await askVisible("请输入下载目录", currentConfig.downloadDir || DEFAULT_CONFIG.downloadDir);
   const quality = await askVisible("请输入默认音质", currentConfig.quality || DEFAULT_CONFIG.quality);

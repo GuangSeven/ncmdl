@@ -11,7 +11,10 @@ json-file schema:
   "steps": [
     {"trigger": "请选择功能", "send": "3\\n"},
     {"trigger": "请输入歌曲 ID", "send": "123456\\n"},
-    {"trigger": "请粘贴新的网易云网页 Cookie", "send": "MUSIC_U=PASTE\\r"}
+    {"trigger": "请粘贴新的网易云网页 Cookie", "send": "MUSIC_U=PASTE\\r"},
+    {"after": 0.1, "send": "\\n"}   # optional: send after fixed delay,
+                                     # no trigger wait (simulates paste burst
+                                     # arriving in separate reads)
   ],
   "done": "再见"   # optional: stop after seeing this
 }
@@ -50,13 +53,14 @@ def main():
     step_idx = 0
     start = time.time()
     last_data = time.time()
+    prev_send = time.time()
 
     while True:
         now = time.time()
         if now - start > timeout_s:
             os.kill(pid, signal.SIGKILL)
             break
-        r, _, _ = select.select([master_fd], [], [], 0.15)
+        r, _, _ = select.select([master_fd], [], [], 0.05)
         if r:
             try:
                 data = os.read(master_fd, 65536)
@@ -68,17 +72,27 @@ def main():
 
         text = output.decode("utf-8", "replace")
         if step_idx < len(steps):
-            trigger = steps[step_idx]["trigger"]
-            if trigger in text:
-                time.sleep(0.2)
-                send = steps[step_idx]["send"].encode("utf-8").decode("unicode_escape").encode("latin1")
-                os.write(master_fd, send)
-                step_idx += 1
-                last_data = time.time()
-            elif now - last_data > 3:
-                # prompt not appearing; abort
-                os.kill(pid, signal.SIGKILL)
-                break
+            step = steps[step_idx]
+            if "after" in step:
+                if now - prev_send >= step["after"]:
+                    send = step["send"].encode("utf-8").decode("unicode_escape").encode("latin1")
+                    os.write(master_fd, send)
+                    step_idx += 1
+                    prev_send = time.time()
+                    last_data = time.time()
+            else:
+                trigger = step["trigger"]
+                if trigger in text:
+                    time.sleep(0.2)
+                    send = step["send"].encode("utf-8").decode("unicode_escape").encode("latin1")
+                    os.write(master_fd, send)
+                    step_idx += 1
+                    prev_send = time.time()
+                    last_data = time.time()
+                elif now - last_data > 3:
+                    # prompt not appearing; abort
+                    os.kill(pid, signal.SIGKILL)
+                    break
         elif done_marker and done_marker in text:
             break
         elif step_idx >= len(steps) and now - last_data > 2:
