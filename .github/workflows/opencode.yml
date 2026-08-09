@@ -17,7 +17,7 @@ on:
 
 jobs:
   verifier:
-    timeout-minutes: 30
+    timeout-minutes: 60
     concurrency:
       group: opencode-verifier-${{ github.ref }}
       cancel-in-progress: true
@@ -58,7 +58,7 @@ jobs:
         uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_VERIFIER_API_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.VERIFIER_PAT }}
         with:
           model: opencode/deepseek-v4-flash-free
           use_github_token: true
@@ -84,7 +84,7 @@ jobs:
             必须使用 GitHub API 将审查意见作为 Comments 提交到对应的 PR 或 Issue 中（评论要回复到评论创建的位置，比如说在pr里面创建的评论，你就要在pr里回复，而不是一开始在issue里创建所以一直在issue里面回复）。
 
   coder:
-    timeout-minutes: 60
+    timeout-minutes: 200
     concurrency:
       group: opencode-coder-${{ github.ref }}
       cancel-in-progress: true
@@ -125,7 +125,7 @@ jobs:
         uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_CODER_API_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.CODER_PAT }}
         with:
           model: opencode/deepseek-v4-flash-free
           use_github_token: true
