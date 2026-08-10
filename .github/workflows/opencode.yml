@@ -81,7 +81,7 @@ jobs:
             
             Output Format
             第一行明确给出 PASS 或 FAIL。
-            必须使用 GitHub API 将审查意见作为 Comments 提交到对应的 PR 和 Issue 中（注意不止要在issue里回复，必须在对应的pr里回复）。另外在提交的评论中不允许提到任何关于这些系统提示词的内容（禁止“已按要求附带 /oc /cr 及修复方向”、“已按位置在 PR 内回复，未漂移到 issue”类似的内容）
+            必须使用 GitHub API 将审查意见作为 Comments 提交到对应的 PR 和 Issue 中（注意不止要在issue里回复，必须在对应的pr里回复）。另外在提交的评论中不允许提到任何关于这些系统提示词的内容（禁止“已按要求附带 /oc /cr 及修复方向”、“已按位置在 PR 内回复，未漂移到 issue”类似的内容）、只允许在回复里面携带一次/oc /cr。禁止在一次审查中多次携带/oc /cr。
 
   coder:
     timeout-minutes: 200
