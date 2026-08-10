@@ -561,7 +561,7 @@ test("TTY：多行粘贴 Cookie 被拒绝，不截断落盘且不产生幽灵选
       { trigger: "请选择功能", send: "3\n" },
       { trigger: "请输入歌曲 ID", send: "abc\n" },
       { trigger: "是否使用当前 Cookie", send: "n\n" },
-      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=AAA\n__csrf=BBB\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n__csrf=BBB\n\x1b[201~" },
       { trigger: "未获取到新 Cookie", send: "0\n" },
     ],
     done: "再见",
@@ -587,8 +587,8 @@ test("TTY：跨 chunk 多行粘贴（拆分到达）不截断落盘、不漏入�
       { trigger: "请选择功能", send: "3\n" },
       { trigger: "请输入歌曲 ID", send: "abc\n" },
       { trigger: "是否使用当前 Cookie", send: "n\n" },
-      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=AAA\n" },
-      { after: 0.1, send: "__csrf=BBB\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 0.1, send: "__csrf=BBB\n\x1b[201~" },
       { trigger: "未获取到新 Cookie", send: "0\n" },
     ],
     done: "再见",
@@ -639,7 +639,7 @@ test("TTY：向导中多行粘贴被拒绝后重新提示而非静默沿用旧 C
     env: { HOME: home },
     steps: [
       { trigger: "请选择功能", send: "2\n" },
-      { trigger: "请输入网易云网页 Cookie", send: "MUSIC_U=AAA\n__csrf=BBB\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n__csrf=BBB\n\x1b[201~" },
       { trigger: "检测到多行粘贴", send: "MUSIC_U=OK\r" },
       { trigger: "请输入 User-Agent", send: "\n" },
       { trigger: "请输入下载目录", send: "\n" },
@@ -748,8 +748,8 @@ test("TTY：菜单 3 慢速多行粘贴（第二行间隔 0.6s，超出原 400ms
       { trigger: "请选择功能", send: "3\n" },
       { trigger: "请输入歌曲 ID", send: "abc\n" },
       { trigger: "是否使用当前 Cookie", send: "n\n" },
-      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=AAA\n" },
-      { after: 0.6, send: "__csrf=BBB\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 0.6, send: "__csrf=BBB\n\x1b[201~" },
       { trigger: "未获取到新 Cookie", send: "0\n" },
     ],
     done: "再见",
@@ -773,8 +773,8 @@ test("TTY：向导慢速多行粘贴被拒绝后重新询问，User-Agent 不被
     env: { HOME: home },
     steps: [
       { trigger: "请选择功能", send: "2\n" },
-      { trigger: "请输入网易云网页 Cookie", send: "MUSIC_U=AAA\n" },
-      { after: 0.6, send: "__csrf=BBB\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 0.6, send: "__csrf=BBB\n\x1b[201~" },
       { trigger: "检测到多行粘贴", send: "MUSIC_U=OK\r" },
       { trigger: "请输入 User-Agent", send: "\n" },
       { trigger: "请输入下载目录", send: "\n" },
@@ -817,4 +817,145 @@ test("TTY：粘贴不带尾随换行 + 停顿不会自动确认，界面明示�
   assert.equal(config.cookie, "MUSIC_U=HINT", "停顿后按回车确认的 Cookie 应完整落盘");
   assert.match(stdout, /按回车确认/, "界面应明示粘贴后需按回车确认");
   assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 3 慢速多行粘贴（第二行间隔 1.5s，超出原 1000ms 尾窗口）被拒绝，不截断落盘且无幽灵选择（回归：行间隔 >1s 时首行被落盘替换旧 Cookie）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 1.5, send: "__csrf=BBB\n\x1b[201~" },
+      { trigger: "未获取到新 Cookie", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "行间隔 1.5s 的多行粘贴也不得把首行截断值落盘替换旧 Cookie");
+  assert.match(stdout, /检测到多行粘贴/, "应提示多行粘贴被拒绝");
+  assert.doesNotMatch(stdout, /无效的选择/, "后续粘贴行不得漏入可见队列产生幽灵选择");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：向导慢速多行粘贴（第二行间隔 1.5s）被拒绝后重新询问，User-Agent 不被污染（回归：行间隔 >1s 时 userAgent 被污染）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 1.5, send: "__csrf=BBB\n\x1b[201~" },
+      { trigger: "检测到多行粘贴", send: "MUSIC_U=OK\r" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "\n" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=OK", "拒绝后重新粘贴的 Cookie 应落盘");
+  assert.equal(config.userAgent, "UA-test", "行间隔 1.5s 的多行粘贴后续行不得污染 User-Agent");
+  assert.match(stdout, /检测到多行粘贴/, "应提示多行粘贴被拒绝");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("TTY：键入回车确认后 0.3s 内输入 0 退出不被吞（回归：确认后窗口内内容字节被吞判拒致挂死）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=FAST\r" },
+      { after: 0.3, send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `退出选择不得被吞（修复前挂死 EXIT -9），实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=FAST", "回车确认的 Cookie 应落盘");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：bracketed paste 结束即自动确认，之后 0.3s 内输入 0 退出不被吞", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=FAST\x1b[201~" },
+      { after: 0.3, send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `粘贴自动确认后退出选择不得被吞，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=FAST", "粘贴结束即自动确认并落盘");
+  assert.match(stdout, /再见！/);
+});
+
+test("管道驱动：向导中 Cookie 行被正确消费，不泄漏为 User-Agent（回归：非 TTY askHidden 不消费队列致字段污染）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "2\nMUSIC_U=x\n\n\n\n\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /配置已保存。/);
+  assert.match(stdout, /再见！/);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=x", "管道提供的 Cookie 行应被向导消费并落盘");
+  assert.equal(config.userAgent, "UA-test", "Cookie 行不得泄漏为 User-Agent");
+});
+
+test("管道驱动：向导后残留空行不误报 EOF，队列中的 0 仍被执行退出（回归：EOF 判定混叠丢退出选项）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "2\n\n\n\n\n\n0\n", home });
+  assert.equal(code, 0);
+  assert.doesNotMatch(stdout, /输入已结束/, "队列里还有 0 时不得误报输入已结束");
+  assert.match(stdout, /再见！/, "残留空行被忽略后应正常退出");
+});
+
+test("管道驱动：菜单 4 后空行被忽略，退出选项 0 正常执行（回归：EOF 判定混叠）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "4\n\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /配置文件:/, "选项 4 应被执行");
+  assert.doesNotMatch(stdout, /输入已结束/, "空行后不得误报输入已结束");
+  assert.match(stdout, /再见！/, "退出选项 0 应被执行");
 });

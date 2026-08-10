@@ -174,11 +174,13 @@ async function interactiveMenu() {
   while (true) {
     printMenu();
     const choice = await askVisible("请选择功能 (0-5)");
-    if (stdinEof && !choice) {
-      stdout.write("输入已结束，退出。\n");
-      break;
-    }
     if (!choice) {
+      if (stdinEof && lineQueue.length === 0) {
+        // 队列已空且流已关闭才是真正的 EOF；队列里还有残留行时不能误报，
+        // 否则会丢掉后面的退出选项（如向导流程尾部残留的空行 + "0"）
+        stdout.write("输入已结束，退出。\n");
+        break;
+      }
       // 空行（常见于粘贴 Cookie 后习惯性回车、或粘贴尾随换行漏入可见队列）不是有效选择，
       // 直接忽略并重新显示菜单，绝不误判为"无效的选择"制造幽灵行
       continue;
@@ -195,14 +197,15 @@ function stopInputReader() {
   if (!inputStarted) {
     return;
   }
-  if (hiddenTailTimer) {
-    clearTimeout(hiddenTailTimer);
-    hiddenTailTimer = null;
-  }
   stdin.off("data", onInputData);
   stdin.off("close", onInputClose);
   if (stdin.isTTY) {
-    stdin.setRawMode(false);
+    try {
+      stdin.setRawMode(false);
+    } catch {
+      // 流已关闭（如 EOF）时 setRawMode 可能抛错，忽略
+    }
+    stdout.write("\x1b[?2004l");
   }
   stdin.pause();
   inputStarted = false;
@@ -215,16 +218,24 @@ const lineQueue = [];
 let visibleBuffer = "";
 let hiddenRead = null;
 let prevChar = "";
-// hidden 输入以"用户回车"显式终结（不再依赖静默判定行边界，避免停顿被误判为输入完成
-// 而截断落盘、剩余字节漏入下一提示）。单行 Cookie 即使按任意字节边界拆成多个 chunk
-// 到达，中途没有换行就会持续累积，停顿多久都不截断，直到用户真正回车。回车后进入
-// "尾窗口"：窗口内每收到一个字节都会重置计时，期间到达的换行被吸收（\r\n 与习惯性
-// 回车），非换行字节则判为多行粘贴并拒绝（绝不落盘截断值、不漏入可见队列）。
-// 尾窗口必须覆盖真实粘贴的行间停顿——慢速多行粘贴按 >400ms 间隔拆分是真实形态
-// （回归测试用 0.6s 间隔），故取 1000ms；仅当回车后连续静默超过该时长才终结。
-// 窗口之外再到达的内容与用户新输入在时序上无法区分，属固有边界。
-const HIDDEN_TAIL_MS = 1000;
-let hiddenTailTimer = null;
+// hidden 输入（TTY raw mode）的终结与粘贴识别：
+// - 普通键入：回车（\r/\n）显式终结，立即返回已累积内容。不做任何"静默超时"判定，
+//   因此输入中途停顿多久都不会被截断，剩余字节也不可能漏入下一个提示。
+// - 粘贴：进入 hidden 时启用终端 bracketed paste（\x1b[?2004h，主流终端均支持），
+//   终端会把整个粘贴内容包在 \x1b[200~ ... \x1b[201~ 之间。因此粘贴无论被终端按什么
+//   字节边界拆成多少次 read、行间停顿多久，都会在结束标记处完整累积，不受时间窗口
+//   影响：
+//   - 多行粘贴（去掉自带尾随换行后仍含换行）整段拒绝（resolve null），绝不截断落盘、
+//     不漏入可见队列；
+//   - 粘贴自带的单个尾随换行（\r\n/\r/\n）被吸收，粘贴结束即自动确认，无需刻意回车；
+//   - 粘贴结束后用户的下一条输入走正常可见路径，绝不因任何窗口被吞。
+// 不支持 bracketed paste 的终端不会返回标记，自动退回"回车确认"行为。
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+
+function isPasteSeqPrefix(seq) {
+  return PASTE_START.startsWith(seq) || PASTE_END.startsWith(seq);
+}
 
 function wakeLineWaiter() {
   if (lineWaiter) {
@@ -234,43 +245,42 @@ function wakeLineWaiter() {
   }
 }
 
-function armHiddenTail() {
-  if (hiddenTailTimer) {
-    clearTimeout(hiddenTailTimer);
-  }
-  hiddenTailTimer = setTimeout(finalizeHiddenInput, HIDDEN_TAIL_MS);
-}
-
-function finalizeHiddenInput() {
-  if (hiddenTailTimer) {
-    clearTimeout(hiddenTailTimer);
-    hiddenTailTimer = null;
-  }
+function resolveHidden(content) {
   const read = hiddenRead;
   if (!read) {
     return;
   }
   hiddenRead = null;
-  prevChar = "";
-  visibleBuffer = "";
   if (stdin.isTTY) {
     try {
       stdin.setRawMode(false);
     } catch {
       // 流已关闭（如 EOF 触发终结）时 setRawMode 可能抛错，忽略
     }
-    stdout.write("\n");
+    stdout.write("\x1b[?2004l\n");
   }
-  const line = read.buffer.join("").trim();
-  // 终结换行之后仍到达的非换行字节说明这是多行粘贴（Cookie 必须单行），拒绝并重新提示，
-  // 且绝不落盘截断后的首行
-  const extra = read.extra.replace(/[\r\n]+/g, "").trim();
-  if (extra.length > 0) {
-    stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
-    read.resolve(null);
+  read.resolve(content);
+}
+
+function finishPaste() {
+  const read = hiddenRead;
+  if (!read) {
     return;
   }
-  read.resolve(line);
+  // 吸收粘贴自带的单个尾随换行（\r\n / \r / \n）
+  const content = read.buffer
+    .join("")
+    .replace(/\r\n$/, "")
+    .replace(/\r$/, "")
+    .replace(/\n$/, "");
+  if (/[\r\n]/.test(content)) {
+    // 去掉尾随换行后仍含换行 => 多行粘贴。Cookie 必须单行：整段拒绝，
+    // 绝不把截断后的首行落盘，也不让剩余行漏入可见队列
+    stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
+    resolveHidden(null);
+    return;
+  }
+  resolveHidden(content.trim());
 }
 
 function onInputData(chunk) {
@@ -278,33 +288,41 @@ function onInputData(chunk) {
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
     if (hiddenRead) {
+      if (char === "\x1b") {
+        hiddenRead.escSeq = "\x1b";
+        continue;
+      }
+      if (hiddenRead.escSeq !== "") {
+        hiddenRead.escSeq += char;
+        if (hiddenRead.escSeq === PASTE_START) {
+          hiddenRead.escSeq = "";
+          hiddenRead.pasteMode = true;
+        } else if (hiddenRead.escSeq === PASTE_END) {
+          hiddenRead.escSeq = "";
+          hiddenRead.pasteMode = false;
+          finishPaste();
+        } else if (!isPasteSeqPrefix(hiddenRead.escSeq)) {
+          // 非粘贴标记（如方向键）的其它转义序列：丢弃，不进入输入内容
+          hiddenRead.escSeq = "";
+        }
+        continue;
+      }
       if (char === "\u0003") {
         exit(130);
         return;
       }
       if (char === "\u0004") {
-        finalizeHiddenInput();
+        resolveHidden(hiddenRead.buffer.join(""));
         return;
       }
       if (char === "\u007f" || char === "\b") {
-        if (!hiddenRead.terminated) {
-          hiddenRead.buffer.pop();
-        }
+        hiddenRead.buffer.pop();
         continue;
       }
-      if (char === "\r" || char === "\n") {
-        // 用户回车即显式终结本次隐藏输入；开启短窗口吸收尾随换行 / 探测多行粘贴
-        hiddenRead.terminated = true;
-        armHiddenTail();
+      if (!hiddenRead.pasteMode && (char === "\r" || char === "\n")) {
+        resolveHidden(hiddenRead.buffer.join(""));
         continue;
       }
-      if (hiddenRead.terminated) {
-        // 终结换行之后仍有非换行字节 => 多行粘贴，累积到 extra 供 finalize 判定拒绝
-        hiddenRead.extra += char;
-        armHiddenTail();
-        continue;
-      }
-      // 尚未回车：持续累积（含跨 chunk / 长停顿），绝不因静默提前终结
       hiddenRead.buffer.push(char);
       continue;
     }
@@ -344,14 +362,11 @@ function onInputClose() {
   stdinEof = true;
   wakeLineWaiter();
   if (hiddenRead) {
-    finalizeHiddenInput();
+    resolveHidden(hiddenRead.buffer.join(""));
   }
 }
 
-async function askVisible(question, defaultValue = "") {
-  const suffix = defaultValue ? ` [${defaultValue}]` : "";
-  ensureInputReader();
-  stdout.write(`${question}${suffix}: `);
+async function readLine(defaultValue = "") {
   while (lineQueue.length === 0 && !stdinEof) {
     await new Promise((resolve) => {
       lineWaiter = resolve;
@@ -364,13 +379,21 @@ async function askVisible(question, defaultValue = "") {
   return raw.trim() || defaultValue;
 }
 
+async function askVisible(question, defaultValue = "") {
+  const suffix = defaultValue ? ` [${defaultValue}]` : "";
+  ensureInputReader();
+  stdout.write(`${question}${suffix}: `);
+  return readLine(defaultValue);
+}
+
 function askHidden(question) {
-  if (!stdin.isTTY) {
-    stdout.write("提示：当前为非交互模式（stdin 非 TTY），无法输入隐藏文本（Cookie）。\n");
-    return Promise.resolve("");
-  }
   ensureInputReader();
   stdout.write(`${question}: `);
+  if (!stdin.isTTY) {
+    // 非交互模式（管道/文件重定向）：像可见输入一样逐行消费队列，
+    // Cookie 行不会泄漏到下一个字段；EOF 时返回空串走"沿用旧值"分支
+    return readLine("");
+  }
   if (lineQueue.length > 0) {
     const value = lineQueue.shift();
     stdout.write("\n");
@@ -378,7 +401,8 @@ function askHidden(question) {
   }
   return new Promise((resolve) => {
     stdin.setRawMode(true);
-    hiddenRead = { buffer: [], extra: "", terminated: false, resolve };
+    stdout.write("\x1b[?2004h");
+    hiddenRead = { buffer: [], escSeq: "", pasteMode: false, resolve };
   });
 }
 
