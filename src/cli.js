@@ -178,6 +178,11 @@ async function interactiveMenu() {
       stdout.write("输入已结束，退出。\n");
       break;
     }
+    if (!choice) {
+      // 空行（常见于粘贴 Cookie 后习惯性回车、或粘贴尾随换行漏入可见队列）不是有效选择，
+      // 直接忽略并重新显示菜单，绝不误判为"无效的选择"制造幽灵行
+      continue;
+    }
     const result = await handleMenuChoice(choice, config);
     config = result.config;
     if (!result.continue) break;
@@ -189,6 +194,10 @@ async function interactiveMenu() {
 function stopInputReader() {
   if (!inputStarted) {
     return;
+  }
+  if (hiddenTailTimer) {
+    clearTimeout(hiddenTailTimer);
+    hiddenTailTimer = null;
   }
   stdin.off("data", onInputData);
   stdin.off("close", onInputClose);
@@ -206,12 +215,13 @@ const lineQueue = [];
 let visibleBuffer = "";
 let hiddenRead = null;
 let prevChar = "";
-// hidden 输入以"静默"判定结束：粘贴内容常按任意字节边界拆成多个 data chunk 到达，
-// 若按首个换行符终止，多行粘贴会被截断、尾随换行会漏入可见队列。捕获期间持续重置
-// 400ms 计时器，无新数据即视为输入完成；期间所有字节（含 \r\n）都收进缓冲区，
-// 因此粘贴是否跨 chunk 不影响结果，也不会有任何标记残留到可见路径
-const HIDDEN_DEBOUNCE_MS = 400;
-let hiddenDebounce = null;
+// hidden 输入以"用户回车"显式终结（不再依赖静默判定行边界，避免停顿被误判为输入完成
+// 而截断落盘、剩余字节漏入下一提示）。单行 Cookie 即使按任意字节边界拆成多个 chunk
+// 到达，中途没有换行就会持续累积，停顿多久都不截断，直到用户真正回车。回车后仅开启一个
+// 400ms 短窗口做两件事：吸收粘贴尾随的额外换行（\r\n 或习惯性回车），以及探测"终结换行
+// 之后仍有非换行字节"的多行粘贴以便拒绝。
+const HIDDEN_TAIL_MS = 400;
+let hiddenTailTimer = null;
 
 function wakeLineWaiter() {
   if (lineWaiter) {
@@ -221,12 +231,22 @@ function wakeLineWaiter() {
   }
 }
 
-function resolveHiddenInput() {
-  if (hiddenDebounce) {
-    clearTimeout(hiddenDebounce);
-    hiddenDebounce = null;
+function armHiddenTail() {
+  if (hiddenTailTimer) {
+    clearTimeout(hiddenTailTimer);
+  }
+  hiddenTailTimer = setTimeout(finalizeHiddenInput, HIDDEN_TAIL_MS);
+}
+
+function finalizeHiddenInput() {
+  if (hiddenTailTimer) {
+    clearTimeout(hiddenTailTimer);
+    hiddenTailTimer = null;
   }
   const read = hiddenRead;
+  if (!read) {
+    return;
+  }
   hiddenRead = null;
   prevChar = "";
   visibleBuffer = "";
@@ -234,22 +254,20 @@ function resolveHiddenInput() {
     try {
       stdin.setRawMode(false);
     } catch {
-      // 流已关闭（如 EOF 触发 resolve）时 setRawMode 可能抛错，忽略
+      // 流已关闭（如 EOF 触发终结）时 setRawMode 可能抛错，忽略
     }
     stdout.write("\n");
   }
-  const lines = read.buffer
-    .join("")
-    .replace(/\r\n/g, "\n")
-    .split(/[\r\n]+/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  if (lines.length > 1) {
+  const line = read.buffer.join("").trim();
+  // 终结换行之后仍到达的非换行字节说明这是多行粘贴（Cookie 必须单行），拒绝并重新提示，
+  // 且绝不落盘截断后的首行
+  const extra = read.extra.replace(/[\r\n]+/g, "").trim();
+  if (extra.length > 0) {
     stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
     read.resolve(null);
     return;
   }
-  read.resolve(lines.length === 1 ? lines[0] : "");
+  read.resolve(line);
 }
 
 function onInputData(chunk) {
@@ -261,17 +279,30 @@ function onInputData(chunk) {
         exit(130);
         return;
       }
-      if (char === "\u007f" || char === "\b") {
-        hiddenRead.buffer.pop();
-        continue;
-      }
       if (char === "\u0004") {
-        resolveHiddenInput();
+        finalizeHiddenInput();
         return;
       }
+      if (char === "\u007f" || char === "\b") {
+        if (!hiddenRead.terminated) {
+          hiddenRead.buffer.pop();
+        }
+        continue;
+      }
+      if (char === "\r" || char === "\n") {
+        // 用户回车即显式终结本次隐藏输入；开启短窗口吸收尾随换行 / 探测多行粘贴
+        hiddenRead.terminated = true;
+        armHiddenTail();
+        continue;
+      }
+      if (hiddenRead.terminated) {
+        // 终结换行之后仍有非换行字节 => 多行粘贴，累积到 extra 供 finalize 判定拒绝
+        hiddenRead.extra += char;
+        armHiddenTail();
+        continue;
+      }
+      // 尚未回车：持续累积（含跨 chunk / 长停顿），绝不因静默提前终结
       hiddenRead.buffer.push(char);
-      clearTimeout(hiddenDebounce);
-      hiddenDebounce = setTimeout(resolveHiddenInput, HIDDEN_DEBOUNCE_MS);
       continue;
     }
     if (char === "\r" || char === "\n" || char === "\u0004") {
@@ -310,7 +341,7 @@ function onInputClose() {
   stdinEof = true;
   wakeLineWaiter();
   if (hiddenRead) {
-    resolveHiddenInput();
+    finalizeHiddenInput();
   }
 }
 
@@ -344,7 +375,7 @@ function askHidden(question) {
   }
   return new Promise((resolve) => {
     stdin.setRawMode(true);
-    hiddenRead = { buffer: [], resolve };
+    hiddenRead = { buffer: [], extra: "", terminated: false, resolve };
   });
 }
 
