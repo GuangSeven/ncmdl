@@ -227,11 +227,16 @@ let prevChar = "";
 //   影响：
 //   - 多行粘贴（去掉自带尾随换行后仍含换行）整段拒绝（resolve null），绝不截断落盘、
 //     不漏入可见队列；
-//   - 粘贴自带的单个尾随换行（\r\n/\r/\n）被吸收，粘贴结束即自动确认，无需刻意回车；
+//   - 粘贴自带的尾随换行（\r\n/\r/\n，含单行后常见的尾部空行）全部被吸收，粘贴结束
+//     即自动确认，无需刻意回车；
 //   - 粘贴结束后用户的下一条输入走正常可见路径，绝不因任何窗口被吞。
-// 不支持 bracketed paste 的终端不会返回标记，自动退回"回车确认"行为。
+// 不支持 bracketed paste 的终端不会返回标记，自动退回"回车确认"行为。此时没有结束
+// 标记可依赖，只能靠短窗口兜底：终结换行后若同一 chunk 还有内容字节，或者短时间内
+// 又有非换行字节到达（粘贴被拆成多次 read 的真实形态），一律按多行粘贴整段拒绝，
+// 绝不把截断后的首行落盘、也不让剩余行漏入可见队列；窗口内只有换行则吸收。
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
+const FALLBACK_TAIL_MS = 200;
 
 function isPasteSeqPrefix(seq) {
   return PASTE_START.startsWith(seq) || PASTE_END.startsWith(seq);
@@ -251,6 +256,10 @@ function resolveHidden(content) {
     return;
   }
   hiddenRead = null;
+  if (read.pendingTimer) {
+    clearTimeout(read.pendingTimer);
+    read.pendingTimer = null;
+  }
   if (stdin.isTTY) {
     try {
       stdin.setRawMode(false);
@@ -262,22 +271,43 @@ function resolveHidden(content) {
   read.resolve(content);
 }
 
+function rejectMultiLinePaste() {
+  stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
+  resolveHidden(null);
+}
+
+function finalizeHiddenInput(read) {
+  // 定时器可能在 hiddenRead 已被替换（向导重询）后才触发，必须核对引用
+  if (!read || hiddenRead !== read) {
+    return;
+  }
+  clearTimeout(read.pendingTimer);
+  read.pendingTimer = null;
+  read.pending = false;
+  resolveHidden(read.buffer.join(""));
+}
+
+function startFallbackTailWindow(read) {
+  // fallback 终端无粘贴标记：终结换行后开启短观察窗口（每收到换行重置），
+  // 窗口内出现内容字节即按多行粘贴整段拒绝，窗口到期才以已累积内容终结
+  clearTimeout(read.pendingTimer);
+  read.pending = true;
+  read.pendingTimer = setTimeout(() => finalizeHiddenInput(read), FALLBACK_TAIL_MS);
+}
+
 function finishPaste() {
   const read = hiddenRead;
   if (!read) {
     return;
   }
-  // 吸收粘贴自带的单个尾随换行（\r\n / \r / \n）
+  // 吸收粘贴自带的全部尾随换行序列（\r\n / \r / \n，含单行后剪贴板常见的尾部空行）
   const content = read.buffer
     .join("")
-    .replace(/\r\n$/, "")
-    .replace(/\r$/, "")
-    .replace(/\n$/, "");
+    .replace(/(?:\r\n|\r|\n)+$/, "");
   if (/[\r\n]/.test(content)) {
-    // 去掉尾随换行后仍含换行 => 多行粘贴。Cookie 必须单行：整段拒绝，
+    // 去掉全部尾随换行后仍含换行 => 多行粘贴。Cookie 必须单行：整段拒绝，
     // 绝不把截断后的首行落盘，也不让剩余行漏入可见队列
-    stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
-    resolveHidden(null);
+    rejectMultiLinePaste();
     return;
   }
   resolveHidden(content.trim());
@@ -297,6 +327,12 @@ function onInputData(chunk) {
         if (hiddenRead.escSeq === PASTE_START) {
           hiddenRead.escSeq = "";
           hiddenRead.pasteMode = true;
+          if (hiddenRead.pending) {
+            // fallback 窗口内新粘贴开始：窗口作废，交给 bracketed paste 标记路径处理
+            clearTimeout(hiddenRead.pendingTimer);
+            hiddenRead.pendingTimer = null;
+            hiddenRead.pending = false;
+          }
         } else if (hiddenRead.escSeq === PASTE_END) {
           hiddenRead.escSeq = "";
           hiddenRead.pasteMode = false;
@@ -307,24 +343,47 @@ function onInputData(chunk) {
         }
         continue;
       }
-      if (char === "\u0003") {
-        exit(130);
-        return;
-      }
+    if (char === "\u0003") {
+      exit(130);
+      return;
+    }
+    if (hiddenRead.pending) {
+      // fallback 终结换行后的观察窗口：吸收换行/退格并重置窗口；
+      // 任何内容字节都说明是拆成多次 read 到达的多行粘贴，整段拒绝
       if (char === "\u0004") {
-        resolveHidden(hiddenRead.buffer.join(""));
+        finalizeHiddenInput(hiddenRead);
         return;
       }
-      if (char === "\u007f" || char === "\b") {
-        hiddenRead.buffer.pop();
+      if (char === "\r" || char === "\n" || char === "\u007f" || char === "\b") {
+        startFallbackTailWindow(hiddenRead);
         continue;
       }
-      if (!hiddenRead.pasteMode && (char === "\r" || char === "\n")) {
-        resolveHidden(hiddenRead.buffer.join(""));
-        continue;
-      }
-      hiddenRead.buffer.push(char);
+      rejectMultiLinePaste();
+      return;
+    }
+    if (char === "\u0004") {
+      resolveHidden(hiddenRead.buffer.join(""));
+      return;
+    }
+    if (char === "\u007f" || char === "\b") {
+      hiddenRead.buffer.pop();
       continue;
+    }
+    if (!hiddenRead.pasteMode && (char === "\r" || char === "\n")) {
+      const rest = text.slice(i + 1);
+      if (rest.replace(/[\r\n]/g, "") !== "") {
+        // 终结换行后同一 chunk 仍有内容字节 => fallback 终端多行粘贴：
+        // 整段拒绝，剩余字节直接丢弃，绝不落盘截断值、不漏入可见队列
+        rejectMultiLinePaste();
+        return;
+      }
+      // 吸收本 chunk 尾随换行（\r\n / \n / \r 结尾不留幽灵空行），
+      // 并开启短窗口等待可能拆成多次 read 到达的粘贴后续行
+      startFallbackTailWindow(hiddenRead);
+      break;
+    }
+    hiddenRead.buffer.push(char);
+    continue;
     }
     if (char === "\r" || char === "\n" || char === "\u0004") {
       if (char === "\n" && prevChar === "\r") {
