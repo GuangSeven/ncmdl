@@ -94,7 +94,7 @@ async function handleMenuChoice(choice, config) {
         if (stdin.isTTY) {
           const keepCookie = await askVisible("是否使用当前 Cookie？(y/n)", "y");
           if (keepCookie.toLowerCase() !== "y") {
-            const newCookie = await askHidden("请粘贴新的网易云网页 Cookie");
+            const newCookie = await askHidden("请粘贴新的网易云网页 Cookie（粘贴后按回车确认）");
             if (newCookie) {
               config.cookie = newCookie;
               await saveConfig(config);
@@ -217,10 +217,13 @@ let hiddenRead = null;
 let prevChar = "";
 // hidden 输入以"用户回车"显式终结（不再依赖静默判定行边界，避免停顿被误判为输入完成
 // 而截断落盘、剩余字节漏入下一提示）。单行 Cookie 即使按任意字节边界拆成多个 chunk
-// 到达，中途没有换行就会持续累积，停顿多久都不截断，直到用户真正回车。回车后仅开启一个
-// 400ms 短窗口做两件事：吸收粘贴尾随的额外换行（\r\n 或习惯性回车），以及探测"终结换行
-// 之后仍有非换行字节"的多行粘贴以便拒绝。
-const HIDDEN_TAIL_MS = 400;
+// 到达，中途没有换行就会持续累积，停顿多久都不截断，直到用户真正回车。回车后进入
+// "尾窗口"：窗口内每收到一个字节都会重置计时，期间到达的换行被吸收（\r\n 与习惯性
+// 回车），非换行字节则判为多行粘贴并拒绝（绝不落盘截断值、不漏入可见队列）。
+// 尾窗口必须覆盖真实粘贴的行间停顿——慢速多行粘贴按 >400ms 间隔拆分是真实形态
+// （回归测试用 0.6s 间隔），故取 1000ms；仅当回车后连续静默超过该时长才终结。
+// 窗口之外再到达的内容与用户新输入在时序上无法区分，属固有边界。
+const HIDDEN_TAIL_MS = 1000;
 let hiddenTailTimer = null;
 
 function wakeLineWaiter() {
@@ -391,10 +394,10 @@ function mergeRuntimeConfig(baseConfig, values) {
 
 async function setupWizard(currentConfig) {
   stdout.write("本地配置向导会把信息保存到 ~/.ncmdl/config.json\n");
-  let cookie = await askHidden("请输入网易云网页 Cookie");
+  let cookie = await askHidden("请输入网易云网页 Cookie（输入后按回车确认）");
   while (cookie === null) {
     // 多行粘贴被拒绝（resolve null）时重新提示，不得静默沿用旧 Cookie
-    cookie = await askHidden("请输入网易云网页 Cookie");
+    cookie = await askHidden("请输入网易云网页 Cookie（输入后按回车确认）");
   }
   const userAgent = await askVisible("请输入 User-Agent", currentConfig.userAgent || DEFAULT_USER_AGENT);
   const downloadDir = await askVisible("请输入下载目录", currentConfig.downloadDir || DEFAULT_CONFIG.downloadDir);
@@ -430,7 +433,7 @@ async function resolveCookie(config, values) {
     return "";
   }
   stdout.write("未检测到 Cookie，需要登录态才能请求网易云接口。\n");
-  return askHidden("请粘贴网易云网页 Cookie");
+  return askHidden("请粘贴网易云网页 Cookie（粘贴后按回车确认）");
 }
 
 async function downloadSongFlow(targetInput, config) {
