@@ -14,6 +14,7 @@ const {
 const { version: APP_VERSION } = require("../package.json");
 const {
   DEFAULT_USER_AGENT,
+  QUALITY_ORDER,
   buildSongOutputPath,
   downloadFile,
   getSongDetail,
@@ -22,6 +23,48 @@ const {
   resolveDownloadUrl
 } = require("./netease");
 const { autoCaptureCookie } = require("./cookie");
+
+const MAIN_MENU_OPTIONS = [
+  { number: "1", value: "1", label: "抓取 Cookie" },
+  { number: "2", value: "2", label: "手动输入配置" },
+  { number: "3", value: "3", label: "下载歌曲" },
+  { number: "4", value: "4", label: "查看配置" },
+  { number: "5", value: "5", label: "重置配置" },
+  { number: "0", value: "0", label: "退出" }
+];
+
+const QUALITY_LABELS = {
+  jymaster: "旗舰音质",
+  dolby: "杜比全景声",
+  sky: "天空声效",
+  jyeffect: "环绕声",
+  hires: "高解析度",
+  lossless: "无损",
+  exhigh: "极高",
+  higher: "较高",
+  standard: "标准"
+};
+
+const QUALITY_OPTIONS = QUALITY_ORDER.map((q, i) => ({
+  number: String(i),
+  value: q,
+  label: `${q}${QUALITY_LABELS[q] ? `（${QUALITY_LABELS[q]}）` : ""}`
+}));
+
+const PATTERN_OPTIONS = [
+  { number: "0", value: "artist-title", label: "歌手 - 歌名（默认）" },
+  { number: "1", value: "title-artist", label: "歌名 - 歌手" },
+  { number: "2", value: "title", label: "仅歌名" }
+];
+
+const CUSTOM_USER_AGENT = Symbol("custom-user-agent");
+const UA_FIREFOX =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0";
+const USER_AGENT_OPTIONS = [
+  { number: "0", value: DEFAULT_USER_AGENT, label: "默认（Chrome 126）" },
+  { number: "1", value: UA_FIREFOX, label: "Firefox 126" },
+  { number: "2", value: CUSTOM_USER_AGENT, label: "自定义输入…" }
+];
 
 function printHelp() {
   stdout.write(`ncmdl - 网易云音乐终端版下载脚本
@@ -42,22 +85,16 @@ function printHelp() {
 
 交互模式:
   直接运行 node src/cli.js 进入交互式菜单
+  菜单用 ←/→（或 ↑/↓）移动、回车确认，或直接输入数字即时进入对应选项
 `);
 }
 
 function printMenu() {
-  stdout.write(`
-╔══════════════════════════════════════════════╗
-║       网易云音乐终端版下载工具 v${APP_VERSION}       ║
-╠══════════════════════════════════════════════╣
-║  1. 抓取 Cookie (自动打开浏览器登录)        ║
-║  2. 手动输入配置                             ║
-║  3. 下载歌曲                                 ║
-║  4. 查看配置                                 ║
-║  5. 重置配置                                 ║
-║  0. 退出                                     ║
-╚══════════════════════════════════════════════╝
-`);
+  stdout.write(`ncmdl v${APP_VERSION}\n\n`);
+  MAIN_MENU_OPTIONS.forEach((option) => {
+    stdout.write(`${option.number}. ${option.label}\n`);
+  });
+  stdout.write("\n");
 }
 
 async function handleMenuChoice(choice, config) {
@@ -83,7 +120,12 @@ async function handleMenuChoice(choice, config) {
       return { continue: true, config };
 
     case "3":
-      const targetInput = await askVisible("请输入歌曲 ID 或链接");
+      const configBeforeCookie = config.cookie;
+      let targetInput = await askVisible("请输入歌曲 ID 或链接");
+      while (targetInput === PASTE_FALLOUT) {
+        // 多行粘贴残留行：守卫已提示，重新询问
+        targetInput = await askVisible("请输入歌曲 ID 或链接");
+      }
       if (!targetInput) {
         stdout.write("未输入歌曲 ID 或链接，返回菜单。\n");
         return { continue: true, config };
@@ -92,12 +134,16 @@ async function handleMenuChoice(choice, config) {
         stdout.write(`当前 Cookie: ${maskSecret(config.cookie)}\n`);
         // 非交互模式下不询问 y/n（无法交互应答，且会劫持脚本管道的下一行输入），直接使用当前 Cookie
         if (stdin.isTTY) {
-          const keepCookie = await askVisible("是否使用当前 Cookie？(y/n)", "y");
+          let keepCookie = await askVisible("是否使用当前 Cookie？(y/n)", "y");
+          while (keepCookie === PASTE_FALLOUT) {
+            keepCookie = await askVisible("是否使用当前 Cookie？(y/n)", "y");
+          }
           if (keepCookie.toLowerCase() !== "y") {
             const newCookie = await askHidden("请粘贴新的网易云网页 Cookie（粘贴后按回车确认）");
             if (newCookie) {
               config.cookie = newCookie;
               await saveConfig(config);
+              return { continue: true, config, pendingCookieRestore: { oldValue: configBeforeCookie } };
             } else {
               stdout.write("未获取到新 Cookie，本次不下载，返回菜单。\n");
               return { continue: true, config };
@@ -109,6 +155,7 @@ async function handleMenuChoice(choice, config) {
         if (pastedCookie) {
           config.cookie = pastedCookie;
           await saveConfig(config);
+          return { continue: true, config, pendingCookieRestore: { oldValue: configBeforeCookie } };
         }
       }
       if (!config.cookie) {
@@ -127,7 +174,10 @@ async function handleMenuChoice(choice, config) {
       return { continue: true, config };
 
     case "5":
-      const confirm = await askVisible("确认重置所有配置？(y/n)", "n");
+      let confirm = await askVisible("确认重置所有配置？(y/n)", "n");
+      while (confirm === PASTE_FALLOUT) {
+        confirm = await askVisible("确认重置所有配置？(y/n)", "n");
+      }
       if (confirm.toLowerCase() === "y") {
         await saveConfig(DEFAULT_CONFIG);
         config = Object.assign({}, DEFAULT_CONFIG);
@@ -172,8 +222,27 @@ async function interactiveMenu() {
   });
 
   while (true) {
-    printMenu();
-    const choice = await askVisible("请选择功能 (0-5)");
+    let choice;
+    if (stdin.isTTY) {
+      choice = await askMenu(MAIN_MENU_OPTIONS, {
+        title: `ncmdl v${APP_VERSION}`,
+        prompt: "请选择功能",
+        defaultIndex: null
+      });
+    } else {
+      printMenu();
+      choice = await askVisible("请选择功能 (0-5)");
+    }
+    if (choice === PASTE_FALLOUT) {
+      // 多行粘贴残留行（如 case 3 刚写入的新 Cookie 被截断）：恢复旧 Cookie，
+      // 提示已由守卫打印，重新显示菜单
+      if (falloutRestore) {
+        config.cookie = falloutRestore.oldValue;
+        await saveConfig(config);
+      }
+      falloutRestore = null;
+      continue;
+    }
     if (!choice) {
       if (stdinEof && lineQueue.length === 0) {
         // 队列已空且流已关闭才是真正的 EOF；队列里还有残留行时不能误报，
@@ -187,6 +256,12 @@ async function interactiveMenu() {
     }
     const result = await handleMenuChoice(choice, config);
     config = result.config;
+    if (result.pendingCookieRestore) {
+      falloutRestore = result.pendingCookieRestore;
+    } else {
+      // 本轮未写入新 Cookie：上一个 case 3 的恢复状态已无残留行风险，解除
+      falloutRestore = null;
+    }
     if (!result.continue) break;
     stdout.write("\n");
   }
@@ -230,13 +305,44 @@ let prevChar = "";
 //   - 粘贴自带的尾随换行（\r\n/\r/\n，含单行后常见的尾部空行）全部被吸收，粘贴结束
 //     即自动确认，无需刻意回车；
 //   - 粘贴结束后用户的下一条输入走正常可见路径，绝不因任何窗口被吞。
-// 不支持 bracketed paste 的终端不会返回标记，自动退回"回车确认"行为。此时没有结束
-// 标记可依赖，只能靠短窗口兜底：终结换行后若同一 chunk 还有内容字节，或者短时间内
-// 又有非换行字节到达（粘贴被拆成多次 read 的真实形态），一律按多行粘贴整段拒绝，
-// 绝不把截断后的首行落盘、也不让剩余行漏入可见队列；窗口内只有换行则吸收。
+// 不支持 bracketed paste 的终端不会返回标记，自动退回"回车确认"行为。此时终结换行
+// 即立即确认，不做任何时间窗口判定（行间停顿多久都不能靠窗口区分"粘贴续行"与
+// "用户下一条输入"，任何固定窗口都会被更快的停顿击穿）。多行粘贴的识别改为：
+//   - 同一 chunk 内终结换行后仍带内容字节 => 整段拒绝（见 onInputData 换行分支）；
+//   - 拆成多次 read 到达的续行 => 进入可见路径后，若该行形如 Cookie（key=value），
+//     由"残留行守卫"在下一提示消费时识别为多行粘贴并拒绝（见 readLine/askMenu），
+//     与停顿时长无关；非 Cookie 形态的续行与用户正常键入在字节上不可区分，
+//     按用户输入处理。
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
-const FALLBACK_TAIL_MS = 200;
+const PASTE_FALLOUT = Symbol("paste-fallout");
+const COOKIE_LINE_RE = /^[^\s=]+=[^\s=]+$/;
+// hidden 输入 resolve 后，下一行可见输入若形如 Cookie（多行粘贴拆分为多次 read 的
+// 续行）则在消费处拒绝。空行不清除标记（晚到的续行不得漏入后续字段）。
+let guardNextVisibleLine = false;
+// 菜单 case 3 从 hidden 输入写入了新 Cookie：若随即发现多行粘贴残留行，恢复旧值。
+let falloutRestore = null;
+// 交互选择器（raw mode）会话；数字即时激活后同一 chunk 紧随的换行需要吞并
+let menuRead = null;
+let menuResolveSwallow = false;
+
+// 残留行守卫：返回 true 表示该行被判定为多行粘贴残留行（已打印拒绝提示）。
+// 空行不清除标记；非 Cookie 形态的续行与用户正常键入无法区分，按用户输入放行。
+function guardVisibleLine(line) {
+  if (!guardNextVisibleLine) {
+    return false;
+  }
+  const trimmed = String(line || "").trim();
+  if (trimmed === "") {
+    return false;
+  }
+  guardNextVisibleLine = false;
+  if (COOKIE_LINE_RE.test(trimmed)) {
+    stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
+    return true;
+  }
+  return false;
+}
 
 function isPasteSeqPrefix(seq) {
   return PASTE_START.startsWith(seq) || PASTE_END.startsWith(seq);
@@ -256,10 +362,7 @@ function resolveHidden(content) {
     return;
   }
   hiddenRead = null;
-  if (read.pendingTimer) {
-    clearTimeout(read.pendingTimer);
-    read.pendingTimer = null;
-  }
+  guardNextVisibleLine = true;
   if (stdin.isTTY) {
     try {
       stdin.setRawMode(false);
@@ -274,25 +377,6 @@ function resolveHidden(content) {
 function rejectMultiLinePaste() {
   stdout.write("检测到多行粘贴：Cookie 应为单行文本，本次输入已忽略，请重新粘贴。\n");
   resolveHidden(null);
-}
-
-function finalizeHiddenInput(read) {
-  // 定时器可能在 hiddenRead 已被替换（向导重询）后才触发，必须核对引用
-  if (!read || hiddenRead !== read) {
-    return;
-  }
-  clearTimeout(read.pendingTimer);
-  read.pendingTimer = null;
-  read.pending = false;
-  resolveHidden(read.buffer.join(""));
-}
-
-function startFallbackTailWindow(read) {
-  // fallback 终端无粘贴标记：终结换行后开启短观察窗口（每收到换行重置），
-  // 窗口内出现内容字节即按多行粘贴整段拒绝，窗口到期才以已累积内容终结
-  clearTimeout(read.pendingTimer);
-  read.pending = true;
-  read.pendingTimer = setTimeout(() => finalizeHiddenInput(read), FALLBACK_TAIL_MS);
 }
 
 function finishPaste() {
@@ -327,12 +411,6 @@ function onInputData(chunk) {
         if (hiddenRead.escSeq === PASTE_START) {
           hiddenRead.escSeq = "";
           hiddenRead.pasteMode = true;
-          if (hiddenRead.pending) {
-            // fallback 窗口内新粘贴开始：窗口作废，交给 bracketed paste 标记路径处理
-            clearTimeout(hiddenRead.pendingTimer);
-            hiddenRead.pendingTimer = null;
-            hiddenRead.pending = false;
-          }
         } else if (hiddenRead.escSeq === PASTE_END) {
           hiddenRead.escSeq = "";
           hiddenRead.pasteMode = false;
@@ -345,20 +423,6 @@ function onInputData(chunk) {
       }
     if (char === "\u0003") {
       exit(130);
-      return;
-    }
-    if (hiddenRead.pending) {
-      // fallback 终结换行后的观察窗口：吸收换行/退格并重置窗口；
-      // 任何内容字节都说明是拆成多次 read 到达的多行粘贴，整段拒绝
-      if (char === "\u0004") {
-        finalizeHiddenInput(hiddenRead);
-        return;
-      }
-      if (char === "\r" || char === "\n" || char === "\u007f" || char === "\b") {
-        startFallbackTailWindow(hiddenRead);
-        continue;
-      }
-      rejectMultiLinePaste();
       return;
     }
     if (char === "\u0004") {
@@ -377,13 +441,95 @@ function onInputData(chunk) {
         rejectMultiLinePaste();
         return;
       }
-      // 吸收本 chunk 尾随换行（\r\n / \n / \r 结尾不留幽灵空行），
-      // 并开启短窗口等待可能拆成多次 read 到达的粘贴后续行
-      startFallbackTailWindow(hiddenRead);
+      // fallback 终端无粘贴标记：终结换行即立即确认（不做时间窗口判定），
+      // 吸收本 chunk 尾随换行（\r\n / \n / \r 结尾不留幽灵空行）；若粘贴被拆成
+      // 多次 read 到达，续行会走可见路径，由残留行守卫（COOKIE_LINE_RE）识别拒绝
+      resolveHidden(hiddenRead.buffer.join(""));
       break;
     }
     hiddenRead.buffer.push(char);
     continue;
+    }
+    if (menuRead) {
+      // 交互选择器（raw mode）按键处理
+      if (char === "\x1b") {
+        menuRead.escSeq = "\x1b";
+        continue;
+      }
+      if (menuRead.escSeq !== "") {
+        menuRead.escSeq += char;
+        const seq = menuRead.escSeq;
+        if (seq === "\x1b[A" || seq === "\x1b[B" || seq === "\x1b[C" || seq === "\x1b[D") {
+          menuRead.escSeq = "";
+          const dir = seq === "\x1b[A" || seq === "\x1b[D" ? -1 : 1;
+          menuRead.selected =
+            (menuRead.selected + dir + menuRead.options.length) % menuRead.options.length;
+          menuRead.moved = true;
+          stdout.write(`\x1b[${menuRead.rows}A`);
+          renderMenu(menuRead);
+        } else if (seq === PASTE_START || seq === PASTE_END) {
+          // 粘贴标记：忽略，内容字节照常累积（bracketed paste 落在选择器上）
+          menuRead.escSeq = "";
+        } else if (!isPasteSeqPrefix(seq)) {
+          menuRead.escSeq = "";
+        }
+        continue;
+      }
+      if (char === "\u0003") {
+        exit(130);
+        return;
+      }
+      if (char === "\u0004") {
+        stdinEof = true;
+        finishMenu(menuRead, "");
+        return;
+      }
+      if (char === "\r" || char === "\n") {
+        const line = menuRead.buffer.trim();
+        if (line !== "") {
+          if (guardVisibleLine(line)) {
+            // 多行粘贴残留行落在选择器上：拒绝并交给调用方（菜单恢复 Cookie / 向导重问）
+            finishMenu(menuRead, PASTE_FALLOUT);
+            return;
+          }
+          finishMenu(menuRead, mapMenuValue(line, menuRead.options, menuRead.defaultValue));
+          return;
+        }
+        if (!menuRead.moved && menuRead.defaultIndex !== null) {
+          // 未移动高亮直接回车：接受默认值（与行输入默认值语义一致）
+          finishMenu(menuRead, menuRead.defaultValue);
+          return;
+        }
+        if (!menuRead.moved) {
+          // 主菜单裸回车（无默认项）：忽略，防止粘贴后的习惯性回车产生幽灵选择
+          continue;
+        }
+        finishMenu(menuRead, menuRead.options[menuRead.selected].value);
+        return;
+      }
+      if (char >= "0" && char <= "9") {
+        if (menuRead.buffer === "") {
+          // 数字即时激活（仅限尚未输入内容的会话首个字符），无需再按回车
+          const hit = menuRead.options.find((option) => String(option.number) === char);
+          if (hit) {
+            menuResolveSwallow = true;
+            finishMenu(menuRead, hit.value);
+            return;
+          }
+          stdout.write("无效的选择，请重新输入。\n");
+          continue;
+        }
+        menuRead.buffer += char;
+        continue;
+      }
+      menuRead.buffer += char;
+      continue;
+    }
+    if (menuResolveSwallow && (char === "\r" || char === "\n")) {
+      // 数字即时激活后同 chunk 紧随的换行：吸收，避免漏成下一个提示的空行
+      menuResolveSwallow = false;
+      prevChar = char;
+      continue;
     }
     if (char === "\r" || char === "\n" || char === "\u0004") {
       if (char === "\n" && prevChar === "\r") {
@@ -404,6 +550,7 @@ function onInputData(chunk) {
     visibleBuffer += char;
     prevChar = "";
   }
+  menuResolveSwallow = false;
 }
 
 function ensureInputReader() {
@@ -422,6 +569,8 @@ function onInputClose() {
   wakeLineWaiter();
   if (hiddenRead) {
     resolveHidden(hiddenRead.buffer.join(""));
+  } else if (menuRead) {
+    finishMenu(menuRead, "");
   }
 }
 
@@ -435,6 +584,9 @@ async function readLine(defaultValue = "") {
     return "";
   }
   const raw = lineQueue.shift();
+  if (guardVisibleLine(raw)) {
+    return PASTE_FALLOUT;
+  }
   return raw.trim() || defaultValue;
 }
 
@@ -443,6 +595,82 @@ async function askVisible(question, defaultValue = "") {
   ensureInputReader();
   stdout.write(`${question}${suffix}: `);
   return readLine(defaultValue);
+}
+
+function mapMenuValue(raw, options, defaultValue) {
+  const line = String(raw).trim();
+  if (line === "") {
+    return defaultValue;
+  }
+  const hit = options.find((option) => String(option.number) === line || option.value === line);
+  return hit ? hit.value : line;
+}
+
+function renderMenu(menu) {
+  if (menu.title !== "") {
+    stdout.write(`${menu.title}\n`);
+  }
+  stdout.write("\n");
+  menu.options.forEach((option, i) => {
+    const line = `${option.number}. ${option.label}`;
+    if (i === menu.selected) {
+      // 当前选择项：红字 + 白底
+      stdout.write(`\x1b[31;47m${line}\x1b[0m\n`);
+    } else {
+      stdout.write(`${line}\n`);
+    }
+  });
+  stdout.write("\n");
+  stdout.write(`${menu.prompt}（←/→ 或 ↑/↓ 选择，回车确认，或直接输入数字）: \n`);
+  menu.rows = (menu.title !== "" ? 1 : 0) + 1 + menu.options.length + 1 + 1;
+}
+
+function finishMenu(menu, value) {
+  menuRead = null;
+  if (stdin.isTTY) {
+    try {
+      stdin.setRawMode(false);
+    } catch {
+      // 流已关闭时 setRawMode 可能抛错，忽略
+    }
+    stdout.write("\n");
+  }
+  menu.resolve(value);
+}
+
+function askMenu(options, { title = "", prompt = "请选择", defaultIndex = null, defaultValue = "" } = {}) {
+  ensureInputReader();
+  if (!stdin.isTTY) {
+    // 非交互模式（管道/文件重定向）：退回行输入，数字或选项值均可
+    stdout.write(`${prompt}${defaultValue ? ` [${defaultValue}]` : ""}: `);
+    return readLine(defaultValue).then((line) =>
+      line === PASTE_FALLOUT ? PASTE_FALLOUT : mapMenuValue(line, options, defaultValue)
+    );
+  }
+  if (lineQueue.length > 0) {
+    // 队列先占：同一次输入 chunk 的后续选择（如 "4\n0\n"）与残留行守卫都走这里
+    const line = lineQueue.shift();
+    if (guardVisibleLine(line)) {
+      return Promise.resolve(PASTE_FALLOUT);
+    }
+    return Promise.resolve(mapMenuValue(line, options, defaultValue));
+  }
+  return new Promise((resolve) => {
+    stdin.setRawMode(true);
+    menuRead = {
+      options,
+      title,
+      prompt,
+      defaultIndex,
+      defaultValue,
+      selected: defaultIndex !== null && defaultIndex >= 0 ? defaultIndex : 0,
+      moved: false,
+      buffer: "",
+      escSeq: "",
+      resolve
+    };
+    renderMenu(menuRead);
+  });
 }
 
 function askHidden(question) {
@@ -482,10 +710,62 @@ async function setupWizard(currentConfig) {
     // 多行粘贴被拒绝（resolve null）时重新提示，不得静默沿用旧 Cookie
     cookie = await askHidden("请输入网易云网页 Cookie（输入后按回车确认）");
   }
-  const userAgent = await askVisible("请输入 User-Agent", currentConfig.userAgent || DEFAULT_USER_AGENT);
-  const downloadDir = await askVisible("请输入下载目录", currentConfig.downloadDir || DEFAULT_CONFIG.downloadDir);
-  const quality = await askVisible("请输入默认音质", currentConfig.quality || DEFAULT_CONFIG.quality);
-  const filenamePattern = await askVisible("请输入文件名模式", currentConfig.filenamePattern || DEFAULT_CONFIG.filenamePattern);
+  // 字段取到多行粘贴残留行（PASTE_FALLOUT）时：重新询问 Cookie 后再问本字段，
+  // 截断的首行 Cookie 不会在向导末尾落盘
+  const retryField = async (prompt) => {
+    for (;;) {
+      const value = await prompt();
+      if (value === PASTE_FALLOUT) {
+        cookie = await askHidden("请输入网易云网页 Cookie（输入后按回车确认）");
+        while (cookie === null) {
+          cookie = await askHidden("请输入网易云网页 Cookie（输入后按回车确认）");
+        }
+        continue;
+      }
+      return value;
+    }
+  };
+  const userAgent = await retryField(async () => {
+    const uaDefault = currentConfig.userAgent || DEFAULT_USER_AGENT;
+    const presetIndex = USER_AGENT_OPTIONS.findIndex((option) => option.value === uaDefault);
+    const picked = await askMenu(USER_AGENT_OPTIONS, {
+      title: "请输入 User-Agent",
+      prompt: "请选择 User-Agent",
+      defaultIndex: presetIndex >= 0 ? presetIndex : USER_AGENT_OPTIONS.length - 1,
+      defaultValue: uaDefault
+    });
+    if (picked === CUSTOM_USER_AGENT) {
+      return askVisible("请输入 User-Agent", uaDefault);
+    }
+    return picked;
+  });
+  const downloadDir = await retryField(() => askVisible("请输入下载目录", currentConfig.downloadDir || DEFAULT_CONFIG.downloadDir));
+  const qualityDefault = currentConfig.quality || DEFAULT_CONFIG.quality;
+  const qualityDefaultIndex = Math.max(
+    0,
+    QUALITY_ORDER.indexOf(normalizeQuality(qualityDefault))
+  );
+  const quality = await retryField(() =>
+    askMenu(QUALITY_OPTIONS, {
+      title: "请输入默认音质",
+      prompt: "请选择默认音质",
+      defaultIndex: qualityDefaultIndex,
+      defaultValue: qualityDefault
+    })
+  );
+  const patternDefault = currentConfig.filenamePattern || DEFAULT_CONFIG.filenamePattern;
+  const patternDefaultIndex = Math.max(
+    0,
+    PATTERN_OPTIONS.findIndex((option) => option.value === patternDefault)
+  );
+  const filenamePattern = await retryField(() =>
+    askMenu(PATTERN_OPTIONS, {
+      title: "请输入文件名模式",
+      prompt: "请选择文件名模式",
+      defaultIndex: patternDefaultIndex,
+      defaultValue: patternDefault
+    })
+  );
   const nextConfig = Object.assign({}, currentConfig, {
     cookie: cookie || currentConfig.cookie || "",
     userAgent: userAgent || currentConfig.userAgent || DEFAULT_USER_AGENT,

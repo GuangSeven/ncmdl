@@ -257,6 +257,7 @@ function buildSongOutputPath(song, config, downloadUrl, contentType) {
 
 module.exports = {
   DEFAULT_USER_AGENT,
+  QUALITY_ORDER,
   buildSongOutputPath,
   buildSongName,
   downloadFile,
