@@ -295,16 +295,30 @@ async function autoCaptureCookie(options = {}) {
   } finally {
     // 如果是复用的已有实例，browserProcess/userDataDir 均为 null，cleanupSession 会跳过。
     // 清理用 try/catch 包裹，避免吞掉 try 块里 waitForLogin 抛出的原始错误。
-    await cleanup(browserProcess, userDataDir);
+    // 传入 port 让 cleanupSession 能识别"进程退出码 0 但浏览器仍存活"的实例交接，
+    // 避免误删仍在使用的临时 profile 目录。
+    await cleanup(browserProcess, userDataDir, port);
   }
 }
 
 /**
  * 关闭本次启动的浏览器进程并清理临时 user-data-dir。
  * 清理失败不会抛出，以免替换 try 块中的原始错误（如登录超时）。
+ *
+ * @param {object|null} browserProcess   本次启动的浏览器子进程（复用已有实例时为 null）
+ * @param {string|null} userDataDir      本次创建的临时 profile 目录（复用时为 null）
+ * @param {number|null} [port]           调试端口：用于检测退出码 0 时浏览器是否仍存活
  */
-async function cleanupSession(browserProcess, userDataDir) {
+async function cleanupSession(browserProcess, userDataDir, port = null) {
   if (browserProcess && !browserProcess.killed) {
+    // 启动进程以退出码 0 自行退出，但调试端口上仍有浏览器在服务 CDP：
+    // 说明实例已转交给新进程继续运行（如 Edge 更新后自动重启）。
+    // 此时不能删除临时 user-data-dir——遗留浏览器正持有它，删掉后登录 Cookie
+    // 无法持久化，后续"复用"会话将永远抓取不到 Cookie。
+    if (browserProcess.exitCode === 0 && port != null) {
+      const debuggerUrl = await getWebSocketDebuggerUrl(port, 1500).catch(() => null);
+      if (debuggerUrl) return;
+    }
     // 先注册 exit 监听，再检查 exitCode：若进程在注册前已退出，exit 事件不会重放，
     // 需手动 resolve，避免 exited 永久 pending（修复检查与注册之间的 TOCTOU 竞态）。
     let resolveExited;
@@ -353,6 +367,9 @@ async function cleanupSession(browserProcess, userDataDir) {
 async function waitForCdpReady(port, browserProcess, timeoutMs = 15000, getSpawnError = null) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
+  // 进程以退出码 0 自行退出时浏览器可能已把实例转交给新进程继续运行
+  //（如 Edge 更新后重启），此时不应立即报"启动失败"，继续等 CDP 就绪。
+  let exitedWithZero = false;
   while (Date.now() < deadline) {
     const spawnError = getSpawnError?.();
     if (spawnError) {
@@ -360,20 +377,27 @@ async function waitForCdpReady(port, browserProcess, timeoutMs = 15000, getSpawn
         `浏览器启动失败: ${spawnError.message}（可能是浏览器路径无效或调试端口被占用）`
       );
     }
+    // 被信号杀死（SIGKILL/OOM/SIGSEGV）时 exitCode 为 null 而 signalCode 有值，需一并检测。
+    if (browserProcess && browserProcess.signalCode != null) {
+      throw new Error(
+        `浏览器进程已退出（被信号 ${browserProcess.signalCode} 终止），可能是启动失败或存在实例冲突，请检查后重试。`
+      );
+    }
     // 用 != null 同时排除 null 与 undefined：browserProcess 为 null（复用实例）
     // 或进程尚未退出时都不应误报 "exit code undefined"。
-    // 被信号杀死（SIGKILL/OOM/SIGSEGV）时 exitCode 为 null 而 signalCode 有值，需一并检测。
+    // 仅退出码非 0 视为确定失败；退出码为 0 时可能是实例交接（见上文注释），
+    // 窗口与调试端口会照常就绪，若 CDP 始终不就绪再由最终超时错误兜底。
     if (
       browserProcess &&
-      (browserProcess.exitCode != null || browserProcess.signalCode != null)
+      browserProcess.exitCode != null &&
+      browserProcess.exitCode !== 0
     ) {
-      const reason =
-        browserProcess.signalCode != null
-          ? `被信号 ${browserProcess.signalCode} 终止`
-          : `exit code ${browserProcess.exitCode}`;
       throw new Error(
-        `浏览器进程已退出（${reason}），可能是启动失败或存在实例冲突，请检查后重试。`
+        `浏览器进程已退出（exit code ${browserProcess.exitCode}），可能是启动失败或存在实例冲突，请检查后重试。`
       );
+    }
+    if (browserProcess && browserProcess.exitCode === 0) {
+      exitedWithZero = true;
     }
     try {
       const debuggerUrl = await getWebSocketDebuggerUrl(port);
@@ -391,7 +415,10 @@ async function waitForCdpReady(port, browserProcess, timeoutMs = 15000, getSpawn
     );
   }
   throw new Error(
-    `等待浏览器调试端口就绪超时${lastError ? `: ${lastError.message}` : ""}。`
+    `等待浏览器调试端口就绪超时${lastError ? `: ${lastError.message}` : ""}。` +
+      (exitedWithZero
+        ? "（浏览器进程已退出，退出码 0，调试端口未就绪，可能未成功启动）"
+        : "")
   );
 }
 

@@ -1,0 +1,1133 @@
+const assert = require("node:assert/strict");
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const test = require("node:test");
+
+const CLI_PATH = path.join(__dirname, "..", "src", "cli.js");
+const { DEFAULT_CONFIG } = require("../src/config");
+
+const WINDOWS_SKIP =
+  "Windows 匿名管道经 fs.fstatSync 无法识别为可交互输入，脚本化菜单测试不适用";
+
+const PTY_DRIVER = path.join(__dirname, "pty_driver.py");
+const PTY_SKIP = "PTY 驱动不可用（缺 python3 或 pty_driver.py），跳过 TTY/raw-mode 测试";
+
+function hasPython() {
+  try {
+    const { spawnSync } = require("node:child_process");
+    if (process.platform === "win32") {
+      return false;
+    }
+    const r = spawnSync("python3", ["-c", "import pty, termios, fcntl; print('ok')"], { timeout: 5000 });
+    return r.status === 0 && fs.existsSync(PTY_DRIVER);
+  } catch {
+    return false;
+  }
+}
+
+const PTY_AVAILABLE = hasPython();
+
+function makeTempHome(cookie = "") {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-cli-test-"));
+  fs.mkdirSync(path.join(dir, ".ncmdl"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".ncmdl", "config.json"),
+    JSON.stringify({
+      cookie,
+      userAgent: "UA-test",
+      downloadDir: "/tmp/dl",
+      quality: "standard",
+      filenamePattern: "artist-title",
+    })
+  );
+  return dir;
+}
+
+function runCli(args, { input = null, home = null, inputFile = null } = {}) {
+  return new Promise((resolve, reject) => {
+    let inputFd = null;
+    let stdio;
+    if (inputFile !== null) {
+      inputFd = fs.openSync(inputFile, "r");
+      stdio = [inputFd, "pipe", "pipe"];
+    } else if (input === null) {
+      stdio = ["ignore", "pipe", "pipe"];
+    } else {
+      stdio = ["pipe", "pipe", "pipe"];
+    }
+    const child = spawn(process.execPath, [CLI_PATH, ...args], {
+      stdio,
+      env: home ? { ...process.env, HOME: home } : process.env,
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(new Error(`子进程超时\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    }, 20000);
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (inputFd !== null) {
+        fs.closeSync(inputFd);
+      }
+      resolve({ code, stdout, stderr });
+    });
+    if (child.stdin) {
+      child.stdin.end(input === null ? undefined : input);
+    }
+  });
+}
+
+function runPty(spec, { timeoutMs = 20000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const specFile = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-pty-spec-")),
+      "spec.json"
+    );
+    fs.writeFileSync(specFile, JSON.stringify(spec));
+    const child = spawn(
+      "python3",
+      [PTY_DRIVER, specFile, String(timeoutMs / 1000)],
+      { env: process.env }
+    );
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(new Error(`PTY 子进程超时\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    }, timeoutMs + 8000);
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const m = stdout.match(/EXIT:(-?\d+)\s*$/);
+      resolve({ code, stdout, stderr, exitCode: m ? Number(m[1]) : null });
+    });
+  });
+}
+
+test("无参数 + 非交互 stdin 打印帮助而非进入菜单（回归：修复前悬空退出）", async () => {
+  const { code, stdout } = await runCli([], { input: null });
+  assert.equal(code, 0);
+  assert.match(stdout, /用法:/, "应输出帮助文本");
+  assert.doesNotMatch(stdout, /请选择功能/, "不应进入交互式菜单");
+});
+
+test("交互菜单在管道输入下依次消费多行选择（修复前第二个选择被吞）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "4\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /配置文件:/, "选项 4（查看配置）应被执行");
+  assert.match(stdout, /再见！/, "选项 0（退出）应被执行");
+});
+
+test("交互菜单对无效选择提示后继续", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "9\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /无效的选择，请重新输入。/);
+  assert.match(stdout, /再见！/);
+});
+
+test("交互菜单直接输入 0 立即退出", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /再见！/);
+});
+
+test("下载选项缺少 Cookie 时中止且不发起网络请求", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome("");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "3\n12345\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /缺少 Cookie，无法下载。/);
+  assert.doesNotMatch(stdout, /下载失败/, "不应尝试真实下载");
+  assert.match(stdout, /再见！/);
+});
+
+test("管道驱动：已配置 Cookie 时选项 3 不询问 y/n，退出选项不被劫持（修复前被 keep-cookie 提示吞掉）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout, stderr } = await runCli([], { input: "3\nabc\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /当前 Cookie:/, "应展示当前 Cookie");
+  assert.match(stderr, /下载失败: 请输入有效的歌曲 ID/, "应使用现有 Cookie 直接进入下载流程（网络前的确定性失败）");
+  assert.match(stdout, /再见！/, "选项 0（退出）不应被 y/n 提示劫持");
+  assert.doesNotMatch(stdout + stderr, /非交互模式|未获取到新 Cookie/, "非 TTY 下不应出现 keep-cookie 询问");
+});
+
+test("TTY：连续选择在同一次输入 chunk 中逐条消费（修复 burst 死锁）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [{ trigger: "请选择功能", send: "4\n0\n" }],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  assert.match(stdout, /配置文件:/, "选项 4（查看配置）应被执行");
+  assert.match(stdout, /再见！/, "选项 0（退出）应被执行");
+});
+
+test("TTY：hidden 粘贴（含 CR）与换行同 chunk 到达时正确保存并退出", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PASTE\r" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=PASTE", "config.json 应写入粘贴的 Cookie");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：hidden 粘贴以 LF 结尾时正确终止", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PASTE\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=PASTE");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：hidden 粘贴以 CRLF 结尾时不产生幽灵空行（修复前菜单多跳一次无效选择）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PASTE\r\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=PASTE", "config.json 应写入粘贴的 Cookie");
+  assert.doesNotMatch(stdout, /无效的选择/, "CRLF 粘贴不应产生幽灵空行");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：CR 与 LF 拆分到不同 chunk 到达时不产生幽灵空行（回归：抑制依赖 chunk 边界）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=SPLIT\r" },
+      { after: 0.1, send: "\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=SPLIT", "拆分到达的 CRLF 粘贴应完整保存");
+  assert.doesNotMatch(stdout, /无效的选择/, "CR 与 LF 拆分到达不应产生幽灵空行");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 3 选择保留当前 Cookie 时直接下载且不改写配置", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "y\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "选 y 时不应改写已保存的 Cookie");
+  assert.match(stdout, /下载失败/, "应使用当前 Cookie 进入下载流程");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 5 重置配置需 y 确认并落盘默认配置", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "5\n" },
+      { trigger: "确认重置所有配置", send: "y\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  const expected = { ...DEFAULT_CONFIG, downloadDir: path.join(home, "Downloads", "ncmdl") };
+  assert.deepEqual(config, expected, "确认重置后应写入默认配置");
+  assert.match(stdout, /配置已重置。/);
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 5 重置配置输入 n 取消且不改写配置", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "5\n" },
+      { trigger: "确认重置所有配置", send: "n\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "取消重置时配置应保持不变");
+  assert.match(stdout, /已取消重置。/);
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：hidden 输入多 chunk 累积后正确终止", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PA" },
+      { after: 0.1, send: "STE\r" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=PASTE", "多 chunk 累积输入应完整保存");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：hidden 输入支持退格删除", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=PASTEX\x7f\r" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=PASTE", "退格应删除最后一个字符");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：raw-mode hidden 输入中 Ctrl+C 退出并返回 130", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=AB\u0003" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 130, `应返回 130，实际 exitCode=${exitCode}\n${stdout}`);
+});
+
+test("TTY：EOF 时提示输入已结束并退出", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [{ trigger: "请选择功能", send: "\u0004" }],
+    done: "输入已结束",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  assert.match(stdout, /输入已结束，退出。/);
+});
+
+test("TTY：菜单 2 向导粘贴 CRLF Cookie 后纯 Enter 逐项接受默认值（回归：suppressNextLine 粘滞吞行死锁）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "MUSIC_U=SETUP\r\n" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "\n" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `向导应完成并正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=SETUP", "粘贴的 Cookie 应写入配置");
+  assert.equal(config.userAgent, "UA-test", "纯 Enter 应接受默认 User-Agent");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("TTY：download 无 ID 手动输入后失败并正常退出（回归：stdin 常驻导致进程永不退出）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH, "download"],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请输入歌曲 ID 或链接", send: "abc\n" },
+    ],
+    done: "错误: 请输入有效的歌曲",
+  });
+  assert.equal(exitCode, 1, `失败后应退出（修复前挂死需 SIGKILL），实际 exitCode=${exitCode}\n${stdout}`);
+});
+
+test("TTY：download 无 Cookie 时粘贴 Cookie 后失败并正常退出（回归：askHidden 出口不清理 stdin）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH, "download", "abc"],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请粘贴网易云网页 Cookie", send: "MUSIC_U=NEW\r\n" },
+    ],
+    done: "错误: 请输入有效的歌曲",
+  });
+  assert.equal(exitCode, 1, `失败后应退出（修复前挂死需 SIGKILL），实际 exitCode=${exitCode}\n${stdout}`);
+});
+
+test("无参数 + stdin 为普通文件时进入菜单并消费文件内容（回归：文件重定向被误判为无输入）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const menuFile = path.join(os.tmpdir(), `ncmdl-menu-input-${Date.now()}.txt`);
+  fs.writeFileSync(menuFile, "4\n0\n");
+  t.after(() => fs.rmSync(menuFile, { force: true }));
+
+  const { code, stdout } = await runCli([], { home, inputFile: menuFile });
+  assert.equal(code, 0);
+  assert.match(stdout, /配置文件:/, "文件重定向应进入菜单并执行选项 4");
+  assert.match(stdout, /再见！/, "应消费文件中的退出选项 0");
+});
+
+test("TTY：菜单 3 无已存 Cookie 时粘贴的 Cookie 落盘（回归：resolveCookie 分支只写内存重启即丢）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "请粘贴网易云网页 Cookie", send: "MUSIC_U=PASTE\r\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=PASTE", "无 Cookie 时菜单 3 粘贴的 Cookie 应落盘");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：多行粘贴 Cookie 被拒绝，不截断落盘且不产生幽灵选择（回归：Cookie 截断 + 剩余行漏入可见队列）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n__csrf=BBB\n\x1b[201~" },
+      { trigger: "未获取到新 Cookie", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "多行粘贴被拒绝后配置不得被截断改写");
+  assert.match(stdout, /检测到多行粘贴/, "应明确提示多行粘贴被拒绝");
+  assert.doesNotMatch(stdout, /无效的选择/, "剩余粘贴行不得漏入可见队列产生幽灵选择");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：跨 chunk 多行粘贴（拆分到达）不截断落盘、不漏入可见队列（回归：截断+幽灵行存活于 chunk 拆分形态）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 0.1, send: "__csrf=BBB\n\x1b[201~" },
+      { trigger: "未获取到新 Cookie", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "跨 chunk 多行粘贴不得截断落盘");
+  assert.match(stdout, /检测到多行粘贴/, "跨 chunk 多行粘贴应被拒绝并提示");
+  assert.doesNotMatch(stdout, /无效的选择/, "后续粘贴行不得漏入可见队列产生幽灵选择");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：CR 结尾粘贴后向导纯 Enter 接受默认值不挂死（回归：pendingHiddenLf 吞掉用户下一个 Enter）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "MUSIC_U=SETUP\r" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "\n" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `向导应完成并正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=SETUP", "CR 结尾粘贴的 Cookie 应完整写入");
+  assert.equal(config.userAgent, "UA-test", "向导中纯 Enter 应接受默认 User-Agent（不得被吞）");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("TTY：向导中多行粘贴被拒绝后重新提示而非静默沿用旧 Cookie（回归：拒绝后静默持久化旧值）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n__csrf=BBB\n\x1b[201~" },
+      { trigger: "检测到多行粘贴", send: "MUSIC_U=OK\r" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "\n" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `向导应完成并正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=OK", "拒绝后重新粘贴的 Cookie 应落盘，而非沿用旧值");
+  assert.match(stdout, /检测到多行粘贴/, "应提示多行粘贴被拒绝");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("TTY：向导中分段输入间隔 0.6s（>tail 窗口）不截断，回车前累积为完整 Cookie 且 User-Agent 不被污染（回归：静默超时截断落盘 + 剩余字节漏入下一提示）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "MUSIC_U=ABCD" },
+      { after: 0.6, send: "EFGH\r" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "\n" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=ABCDEFGH", "停顿 0.6s 的分段输入应在回车时累积为完整 Cookie，不得被截断为 MUSIC_U=ABCD");
+  assert.equal(config.userAgent, "UA-test", "分段输入的剩余字节不得漏入 User-Agent 提示");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("TTY：菜单 3 分段输入间隔 0.6s 不截断落盘且不产生幽灵选择（回归：静默超时截断 + 菜单幽灵无效选择）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=IJ" },
+      { after: 0.6, send: "KLMN\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=IJKLMN", "停顿 0.6s 的分段输入应累积为完整 Cookie，不得被截断为 MUSIC_U=IJ");
+  assert.doesNotMatch(stdout, /无效的选择/, "分段输入的剩余字节不得漏入可见队列产生幽灵选择");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 3 粘贴 Cookie 后习惯性回车不产生幽灵「无效的选择」（回归：回车落在 hidden 终结后入队当菜单选项）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "请粘贴网易云网页 Cookie", send: "MUSIC_U=CONFIRM\n" },
+      { after: 0.6, send: "\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=CONFIRM", "粘贴的 Cookie 应完整落盘");
+  assert.doesNotMatch(stdout, /无效的选择/, "粘贴终结后的习惯性回车应被忽略，不得当作菜单选项产生幽灵行");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 3 慢速多行粘贴（第二行间隔 0.6s，超出原 400ms 尾窗口）被拒绝，不截断落盘且无幽灵选择（回归：截断落盘 + 幽灵行存活于慢速形态）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 0.6, send: "__csrf=BBB\n\x1b[201~" },
+      { trigger: "未获取到新 Cookie", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "慢速多行粘贴不得把首行截断值落盘");
+  assert.match(stdout, /检测到多行粘贴/, "慢速多行粘贴应被拒绝并提示");
+  assert.doesNotMatch(stdout, /无效的选择/, "后续粘贴行不得漏入可见队列产生幽灵选择");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：向导慢速多行粘贴被拒绝后重新询问，User-Agent 不被污染（回归：第二行被 User-Agent 提示吞掉）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 0.6, send: "__csrf=BBB\n\x1b[201~" },
+      { trigger: "检测到多行粘贴", send: "MUSIC_U=OK\r" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "\n" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=OK", "拒绝后重新粘贴的 Cookie 应落盘");
+  assert.equal(config.userAgent, "UA-test", "慢速多行粘贴的后续行不得污染 User-Agent");
+  assert.match(stdout, /检测到多行粘贴/, "应提示多行粘贴被拒绝");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("TTY：粘贴不带尾随换行 + 停顿不会自动确认，界面明示需按回车（回归：README 自动确认承诺与实现矛盾致挂死）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "请粘贴网易云网页 Cookie", send: "MUSIC_U=HINT" },
+      { after: 1.3, send: "\r" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=HINT", "停顿后按回车确认的 Cookie 应完整落盘");
+  assert.match(stdout, /按回车确认/, "界面应明示粘贴后需按回车确认");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单 3 慢速多行粘贴（第二行间隔 1.5s，超出原 1000ms 尾窗口）被拒绝，不截断落盘且无幽灵选择（回归：行间隔 >1s 时首行被落盘替换旧 Cookie）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 1.5, send: "__csrf=BBB\n\x1b[201~" },
+      { trigger: "未获取到新 Cookie", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "行间隔 1.5s 的多行粘贴也不得把首行截断值落盘替换旧 Cookie");
+  assert.match(stdout, /检测到多行粘贴/, "应提示多行粘贴被拒绝");
+  assert.doesNotMatch(stdout, /无效的选择/, "后续粘贴行不得漏入可见队列产生幽灵选择");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：向导慢速多行粘贴（第二行间隔 1.5s）被拒绝后重新询问，User-Agent 不被污染（回归：行间隔 >1s 时 userAgent 被污染）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "\x1b[200~MUSIC_U=AAA\n" },
+      { after: 1.5, send: "__csrf=BBB\n\x1b[201~" },
+      { trigger: "检测到多行粘贴", send: "MUSIC_U=OK\r" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "\n" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=OK", "拒绝后重新粘贴的 Cookie 应落盘");
+  assert.equal(config.userAgent, "UA-test", "行间隔 1.5s 的多行粘贴后续行不得污染 User-Agent");
+  assert.match(stdout, /检测到多行粘贴/, "应提示多行粘贴被拒绝");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("TTY：键入回车确认后 0.3s 内输入 0 退出不被吞（回归：确认后窗口内内容字节被吞判拒致挂死）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=FAST\r" },
+      { after: 0.3, send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `退出选择不得被吞（修复前挂死 EXIT -9），实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=FAST", "回车确认的 Cookie 应落盘");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：bracketed paste 结束即自动确认，之后 0.3s 内输入 0 退出不被吞", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "\x1b[200~MUSIC_U=FAST\x1b[201~" },
+      { after: 0.3, send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `粘贴自动确认后退出选择不得被吞，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=FAST", "粘贴结束即自动确认并落盘");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：fallback 多行粘贴第二行间隔 0.3s（超出原 200ms 尾窗口）被拒绝，不截断落盘且无幽灵选择（回归：窗口外停顿仍截断落盘+幽灵行）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=AAA\n" },
+      { after: 0.3, send: "__csrf=BBB\n" },
+      { trigger: "检测到多行粘贴", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "行间隔 0.3s 的多行粘贴不得把截断首行落盘替换旧 Cookie");
+  assert.match(stdout, /检测到多行粘贴/, "应明确提示多行粘贴被拒绝");
+  assert.doesNotMatch(stdout, /无效的选择/, "后续粘贴行不得漏入可见队列产生幽灵选择");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：向导中 fallback 多行粘贴第二行间隔 0.3s 被拒绝后重新询问，User-Agent 不被污染", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "MUSIC_U=AAA\n" },
+      { after: 0.3, send: "__csrf=BBB\n" },
+      { trigger: "检测到多行粘贴", send: "MUSIC_U=OK\r" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "\n" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=OK", "拒绝后重新粘贴的 Cookie 应落盘，而非截断值");
+  assert.equal(config.userAgent, "UA-test", "多行粘贴后续行不得污染 User-Agent");
+  assert.match(stdout, /检测到多行粘贴/, "应提示多行粘贴被拒绝");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("TTY：回车确认后 0.1s 内输入 0 退出不被吞、Cookie 不被误拒（回归：窗口内内容字节吞键判拒致挂死）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=FAST\r" },
+      { after: 0.1, send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `退出选择不得被吞（修复前挂死 EXIT -9），实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=FAST", "回车确认的 Cookie 应完整落盘，不得被误拒");
+  assert.doesNotMatch(stdout, /检测到多行粘贴/, "0 是用户输入而非多行粘贴续行，不得判拒");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：fallback 单 chunk 多行粘贴（无粘贴标记）被拒绝，不截断落盘且无幽灵选择", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "3\n" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "n\n" },
+      { trigger: "请粘贴新的网易云网页 Cookie", send: "MUSIC_U=AAA\n__csrf=BBB\n" },
+      { trigger: "未获取到新 Cookie", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=old-cookie", "多行粘贴不得截断落盘");
+  assert.match(stdout, /检测到多行粘贴/, "应提示多行粘贴被拒绝");
+  assert.doesNotMatch(stdout, /无效的选择/, "剩余粘贴行不得漏入可见队列产生幽灵选择");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单用方向键移动高亮并回车确认选择（新交互菜单）", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "\x1b[C\x1b[C\r" },
+      { trigger: "请输入歌曲 ID", send: "abc\n" },
+      { trigger: "是否使用当前 Cookie", send: "y\n" },
+      { trigger: "下载失败", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  assert.match(stdout, /下载失败/, "方向键移动到选项 3 后回车应进入下载流程");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：菜单直接输入数字即时进入对应选项，无需再按回车", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "4" },
+      { trigger: "请选择功能", send: "0" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  assert.match(stdout, /配置文件:/, "数字 4 即时进入查看配置");
+  assert.match(stdout, /再见！/);
+});
+
+test("TTY：向导默认音质改为可切换选项，输入数字即时选择", { skip: !PTY_AVAILABLE ? PTY_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { exitCode, stdout } = await runPty({
+    cmd: ["node", CLI_PATH],
+    env: { HOME: home },
+    steps: [
+      { trigger: "请选择功能", send: "2\n" },
+      { trigger: "请输入网易云网页 Cookie", send: "MUSIC_U=q\r" },
+      { trigger: "请输入 User-Agent", send: "\n" },
+      { trigger: "请输入下载目录", send: "\n" },
+      { trigger: "请输入默认音质", send: "2" },
+      { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请选择功能", send: "0\n" },
+    ],
+    done: "再见",
+  });
+  assert.equal(exitCode, 0, `应正常退出，实际 exitCode=${exitCode}\n${stdout}`);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.quality, "sky", "音质选择器输入数字 2 应选到 sky");
+  assert.match(stdout, /配置已保存。/);
+});
+
+test("管道驱动：向导中 Cookie 行被正确消费，不泄漏为 User-Agent（回归：非 TTY askHidden 不消费队列致字段污染）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "2\nMUSIC_U=x\n\n\n\n\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /配置已保存。/);
+  assert.match(stdout, /再见！/);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.cookie, "MUSIC_U=x", "管道提供的 Cookie 行应被向导消费并落盘");
+  assert.equal(config.userAgent, "UA-test", "Cookie 行不得泄漏为 User-Agent");
+});
+
+test("管道驱动：向导后残留空行不误报 EOF，队列中的 0 仍被执行退出（回归：EOF 判定混叠丢退出选项）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome("MUSIC_U=old-cookie");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "2\n\n\n\n\n\n0\n", home });
+  assert.equal(code, 0);
+  assert.doesNotMatch(stdout, /输入已结束/, "队列里还有 0 时不得误报输入已结束");
+  assert.match(stdout, /再见！/, "残留空行被忽略后应正常退出");
+});
+
+test("管道驱动：菜单 4 后空行被忽略，退出选项 0 正常执行（回归：EOF 判定混叠）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "4\n\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /配置文件:/, "选项 4 应被执行");
+  assert.doesNotMatch(stdout, /输入已结束/, "空行后不得误报输入已结束");
+  assert.match(stdout, /再见！/, "退出选项 0 应被执行");
+});

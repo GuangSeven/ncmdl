@@ -483,6 +483,65 @@ test("cleanupSession resolves immediately for an already-exited process", async 
   assert.ok(Date.now() - start < 1000, "Should not wait for exit timeout");
 });
 
+test("cleanupSession keeps the profile dir when a handoff browser still serves CDP", async (t) => {
+  // 启动进程以退出码 0 退出，但调试端口上仍有浏览器实例（转交新进程后继续运行）：
+  // 不能删除 user-data-dir，否则遗留实例的登录 Cookie 无法持久化，
+  // 后续"复用"会话将永远抓取不到 Cookie
+  const server = http.createServer((req, res) => {
+    if (req.url === "/json/version") {
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1/live" }));
+    } else {
+      res.statusCode = 404;
+      res.end();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-test-"));
+  t.after(() => {
+    server.close();
+    fs.rmSync(dir, { force: true, recursive: true });
+  });
+
+  let killCalled = false;
+  const fake = {
+    exitCode: 0,
+    killed: false,
+    once() {
+      return this;
+    },
+    kill() {
+      killCalled = true;
+      return true;
+    },
+  };
+  await cleanupSession(fake, dir, port);
+  assert.equal(fs.existsSync(dir), true, "profile dir must be kept for the surviving browser");
+  assert.equal(killCalled, false, "must not signal the handed-off browser");
+});
+
+test("cleanupSession removes the profile dir when the exit-0 process is truly gone", async () => {
+  // 退出码 0 且端口上已无 CDP 服务：浏览器确实退出了，应正常清理临时目录
+  const probe = net.createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const freePort = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ncmdl-test-"));
+  const fake = {
+    exitCode: 0,
+    killed: false,
+    once() {
+      return this;
+    },
+    kill() {
+      return true;
+    },
+  };
+  await cleanupSession(fake, dir, freePort);
+  assert.equal(fs.existsSync(dir), false, "profile dir should be removed");
+});
+
 test("getPages rejects when the server accepts but never responds", async () => {
   const server = net.createServer(() => {
     // 接受 TCP 连接但不返回任何 HTTP 响应（模拟半打开连接）
@@ -511,6 +570,39 @@ test("waitForCdpReady throws when spawn fails asynchronously", async () => {
     waitForCdpReady(9, fakeProcess, 1000, () => new Error("spawn ENOENT")),
     /浏览器启动失败.*ENOENT/
   );
+});
+
+test("waitForCdpReady succeeds when the process exited 0 but CDP is up", async () => {
+  // Windows 上 Edge/Chrome 可能把启动的实例转交给新进程（原进程以退出码 0 退出），
+  // 但浏览器窗口与调试端口照常就绪 —— 此时不应误报"进程已退出"
+  const server = http.createServer((req, res) => {
+    if (req.url === "/json/version") {
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1/handoff" }));
+    } else {
+      res.statusCode = 404;
+      res.end();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const fakeProcess = { exitCode: 0, killed: false };
+  try {
+    const url = await waitForCdpReady(port, fakeProcess, 2000);
+    assert.equal(url, "ws://127.0.0.1/handoff");
+  } finally {
+    server.close();
+  }
+});
+
+test("waitForCdpReady reports timeout with exit-0 note when CDP never comes up", async () => {
+  // 进程退出码 0 但 CDP 始终不就绪：应等到超时并给出退出码提示，而非立即误报失败
+  const probe = net.createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const freePort = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+  const fakeProcess = { exitCode: 0, killed: false };
+  await assert.rejects(waitForCdpReady(freePort, fakeProcess, 500), /超时.*退出码 0/);
 });
 
 test("autoCaptureCookie throws when no browser executable is found", async () => {

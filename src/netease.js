@@ -123,7 +123,9 @@ function sanitizeFilename(filename) {
 
 function buildSongName(song, pattern = "artist-title") {
   const title = song?.name || "unknown";
-  const artist = Array.isArray(song?.ar) && song.ar.length > 0 ? song.ar.map((item) => item.name).filter(Boolean).join(" & ") : "unknown";
+  // weapi 详情返回 ar、公开接口返回 artists，两种结构都兼容
+  const artists = Array.isArray(song?.ar) ? song.ar : Array.isArray(song?.artists) ? song.artists : [];
+  const artist = artists.length > 0 ? artists.map((item) => item.name).filter(Boolean).join(" & ") : "unknown";
   switch (pattern) {
     case "title":
       return title;
@@ -178,6 +180,44 @@ async function requestWeapi(endpoint, data, config = {}) {
   if (!response.ok) {
     throw new Error(`网易云接口请求失败：HTTP ${response.status} ${response.statusText}，${text.slice(0, 200)}`);
   }
+  if (!text) {
+    // 网易云风控：weapi 路由对非白名单请求直接返回 200 + 空 body（curl/Node/浏览器实测均如此）。
+    // 标记 blockedByWaf，上层据此回退到未加密的公开接口。
+    const error = new Error("网易云 weapi 接口返回空响应（可能被风控拦截）");
+    error.blockedByWaf = true;
+    throw error;
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`网易云接口返回了非 JSON 内容：${text.slice(0, 200)}`);
+  }
+}
+
+/**
+ * 公开（非 weapi）接口请求：weapi 被风控拦截时的回退通道。
+ * 公开接口无需 weapi 加密，但通常要求携带有效登录 Cookie。
+ */
+async function requestPublicApi(endpoint, query, config = {}) {
+  if (typeof fetch !== "function") {
+    throw new Error("当前 Node 版本缺少 fetch，请使用 Node.js 18 或更高版本。");
+  }
+  const cookie = config.cookie || "";
+  const userAgent = config.userAgent || DEFAULT_USER_AGENT;
+  const requestUrl = `https://music.163.com${endpoint}?${new URLSearchParams(query).toString()}`;
+  const response = await fetch(requestUrl, {
+    headers: {
+      Accept: "application/json, text/plain, */*",
+      Origin: "https://music.163.com",
+      Referer: "https://music.163.com/",
+      Cookie: cookie,
+      "User-Agent": userAgent
+    }
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`网易云接口请求失败：HTTP ${response.status} ${response.statusText}，${text.slice(0, 200)}`);
+  }
   try {
     return JSON.parse(text);
   } catch (error) {
@@ -186,14 +226,66 @@ async function requestWeapi(endpoint, data, config = {}) {
 }
 
 async function getSongDetail(songId, config) {
-  return requestWeapi(
-    "/api/v3/song/detail",
-    {
-      c: JSON.stringify([{ id: songId }]),
-      ids: JSON.stringify([songId])
-    },
-    config
-  );
+  try {
+    return await requestWeapi(
+      "/api/v3/song/detail",
+      {
+        c: JSON.stringify([{ id: songId }]),
+        ids: JSON.stringify([songId])
+      },
+      config
+    );
+  } catch (error) {
+    if (!error.blockedByWaf) throw error;
+    // weapi 被风控拦截时回退公开接口
+    return requestPublicApi("/api/song/detail/", { id: songId, ids: `[${songId}]` }, config);
+  }
+}
+
+/**
+ * 获取专辑详情（含发行公司/发售日期/专辑艺人），标签写入用。
+ */
+async function getAlbumDetail(albumId, config) {
+  if (!albumId) return null;
+  try {
+    return await requestWeapi("/api/v1/album", { id: albumId }, config);
+  } catch (error) {
+    if (!error.blockedByWaf) throw error;
+    return requestPublicApi(`/api/album/${albumId}`, {}, config);
+  }
+}
+
+/**
+ * 获取歌词（lrc.lyric 为原文，tlyric.lyric 为翻译）。
+ */
+async function getLyric(songId, config) {
+  try {
+    return await requestWeapi(
+      "/api/song/lyric/v1",
+      { id: songId, cp: false, tv: 0, lv: 0, rv: 0, kv: 0, yv: 0, ytv: 0, yrv: 0 },
+      config
+    );
+  } catch (error) {
+    if (!error.blockedByWaf) throw error;
+    return requestPublicApi("/api/song/lyric", { id: songId, lv: 1, kv: 1, tv: 1 }, config);
+  }
+}
+
+/**
+ * 下载图片字节（专辑封面）。
+ */
+async function fetchImage(url, config = {}) {
+  const userAgent = config.userAgent || DEFAULT_USER_AGENT;
+  const response = await fetch(url, {
+    headers: {
+      Referer: "https://music.163.com/",
+      "User-Agent": userAgent
+    }
+  });
+  if (!response.ok) {
+    throw new Error(`图片下载失败：HTTP ${response.status} ${response.statusText}`);
+  }
+  return Buffer.from(await response.arrayBuffer());
 }
 
 async function resolveDownloadUrl(songId, quality, config) {
@@ -208,10 +300,33 @@ async function resolveDownloadUrl(songId, quality, config) {
       buildData: (level) => ({ ids: JSON.stringify([songId]), level, encodeType: "mp3" })
     }
   ];
+  // weapi 被风控拦截后置 true：后续候选不再尝试 weapi，直接走公开接口
+  let weapiBlocked = false;
 
   for (const level of qualities) {
     for (const candidate of endpointCandidates) {
-      const result = await requestWeapi(candidate.endpoint, candidate.buildData(level), config);
+      let result = null;
+      if (!weapiBlocked) {
+        try {
+          result = await requestWeapi(candidate.endpoint, candidate.buildData(level), config);
+        } catch (error) {
+          if (!error.blockedByWaf) throw error;
+          weapiBlocked = true;
+        }
+      }
+      if (!result) {
+        // 公开接口回退：结构与 weapi 的 v1 一致（data[0].url），无需加密
+        result = await requestPublicApi(
+          "/api/song/enhance/player/url/v1",
+          {
+            ids: `[${songId}]`,
+            level,
+            encodeType: "mp3",
+            csrf_token: getCsrfToken(config.cookie || "")
+          },
+          config
+        );
+      }
       const data = Array.isArray(result?.data) ? result.data[0] : result?.data || result;
       const url = data?.url || data?.freeTrialInfo?.url || data?.privilege?.downloadUrl;
       if (url) {
@@ -257,15 +372,20 @@ function buildSongOutputPath(song, config, downloadUrl, contentType) {
 
 module.exports = {
   DEFAULT_USER_AGENT,
+  QUALITY_ORDER,
   buildSongOutputPath,
   buildSongName,
   downloadFile,
+  fetchImage,
+  getAlbumDetail,
+  getLyric,
   getQualityFallbackOrder,
   getSongDetail,
   guessExtension,
   normalizeQuality,
   parseCookie,
   parseSongId,
+  requestPublicApi,
   requestWeapi,
   resolveDownloadUrl,
   sanitizeFilename
