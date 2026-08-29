@@ -23,6 +23,7 @@ const {
   resolveDownloadUrl
 } = require("./netease");
 const { autoCaptureCookie } = require("./cookie");
+const { collectSongMetadata, writeMusicTags } = require("./tagger");
 
 const MAIN_MENU_OPTIONS = [
   { number: "1", value: "1", label: "抓取 Cookie" },
@@ -810,7 +811,12 @@ async function downloadSongFlow(targetInput, config) {
     throw new Error(`没有找到歌曲信息，ID: ${songId}`);
   }
   stdout.write(`歌曲: ${song.name || "unknown"}\n`);
-  stdout.write(`歌手: ${Array.isArray(song.ar) ? song.ar.map((item) => item.name).join(" / ") : "unknown"}\n`);
+  const songArtists = Array.isArray(song.ar)
+    ? song.ar
+    : Array.isArray(song.artists)
+      ? song.artists
+      : [];
+  stdout.write(`歌手: ${songArtists.length > 0 ? songArtists.map((item) => item.name).join(" / ") : "unknown"}\n`);
   const downloadRes = await resolveDownloadUrl(songId, config.quality, config);
   const outputPath = buildSongOutputPath(song, config, downloadRes.url, "");
   stdout.write(`音质: ${downloadRes.level}\n`);
@@ -822,6 +828,14 @@ async function downloadSongFlow(targetInput, config) {
   stdout.write(`下载完成: ${outputPath}\n`);
   if (fileMeta.contentType) {
     stdout.write(`文件类型: ${fileMeta.contentType}\n`);
+  }
+  // 写入音乐元数据（歌词/专辑/发售日期/封面等），失败不影响已下载文件
+  try {
+    const meta = await collectSongMetadata(song, config);
+    const summary = writeMusicTags(outputPath, song, meta);
+    stdout.write(`已写入音乐标签: ${summary}\n`);
+  } catch (tagError) {
+    stdout.write(`写入音乐标签失败（不影响已下载文件）: ${tagError.message}\n`);
   }
 }
 
