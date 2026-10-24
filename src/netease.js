@@ -109,6 +109,57 @@ function parseSongId(input) {
   return null;
 }
 
+/**
+ * 解析专辑 ID：支持专辑链接、`album:123` / `album=123` 前缀，以及带 #/album 的路由。
+ * 裸数字无法区分歌曲/专辑，因此不在此处理（由 parseTarget 按歌曲兜底）。
+ */
+function parseAlbumId(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+  const prefixed = raw.match(/^album[:=](\d+)$/i);
+  if (prefixed) return Number(prefixed[1]);
+  if (!/album/i.test(raw)) return null;
+  const patterns = [
+    /album\?id=(\d+)/i,
+    /album\/(\d+)/i,
+    /[?&#]id=(\d+)/i
+  ];
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+/**
+ * 解析单个下载目标：专辑优先于歌曲（专辑链接同样带 ?id=，避免被当成歌曲）。
+ * @returns {{type: "song"|"album", id: number}|null}
+ */
+function parseTarget(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+  const albumId = parseAlbumId(raw);
+  if (albumId) return { type: "album", id: albumId };
+  const songId = parseSongId(raw);
+  if (songId) return { type: "song", id: songId };
+  return null;
+}
+
+/**
+ * 把一组输入（字符串或字符串数组）按空白/中英文逗号分号顿号切分为目标 token。
+ */
+function splitTargetList(values) {
+  const list = Array.isArray(values) ? values : [values];
+  const tokens = [];
+  for (const value of list) {
+    const parts = String(value == null ? "" : value).split(/[\s,，;；、]+/);
+    for (const part of parts) {
+      if (part) tokens.push(part);
+    }
+  }
+  return tokens;
+}
+
 function sanitizeFilename(filename) {
   if (!filename) return "downloaded_file";
   let sanitized = String(filename).replace(/\//g, "／");
@@ -225,6 +276,39 @@ async function requestPublicApi(endpoint, query, config = {}) {
   }
 }
 
+/**
+ * 公开接口的 POST 表单请求（旧版明文接口，无需 weapi 加密）。
+ */
+async function requestPublicApiPost(endpoint, form, config = {}) {
+  if (typeof fetch !== "function") {
+    throw new Error("当前 Node 版本缺少 fetch，请使用 Node.js 18 或更高版本。");
+  }
+  const cookie = config.cookie || "";
+  const userAgent = config.userAgent || DEFAULT_USER_AGENT;
+  const requestUrl = `https://music.163.com${endpoint}`;
+  const response = await fetch(requestUrl, {
+    method: "POST",
+    headers: {
+      Accept: "application/json, text/plain, */*",
+      "Content-Type": "application/x-www-form-urlencoded",
+      Origin: "https://music.163.com",
+      Referer: "https://music.163.com/",
+      Cookie: cookie,
+      "User-Agent": userAgent
+    },
+    body: new URLSearchParams(form).toString()
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`网易云接口请求失败：HTTP ${response.status} ${response.statusText}，${text.slice(0, 200)}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`网易云接口返回了非 JSON 内容：${text.slice(0, 200)}`);
+  }
+}
+
 async function getSongDetail(songId, config) {
   try {
     return await requestWeapi(
@@ -243,6 +327,31 @@ async function getSongDetail(songId, config) {
 }
 
 /**
+ * 批量获取歌曲详情（weapi 被风控时回退公开接口），并按传入顺序返回。
+ * 专辑内所有歌曲可一次请求取回，避免逐首请求。
+ */
+async function getSongDetails(songIds, config) {
+  const ids = (Array.isArray(songIds) ? songIds : [songIds])
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0);
+  if (ids.length === 0) return [];
+  let result;
+  try {
+    result = await requestWeapi(
+      "/api/v3/song/detail",
+      { c: JSON.stringify(ids.map((id) => ({ id }))), ids: JSON.stringify(ids) },
+      config
+    );
+  } catch (error) {
+    if (!error.blockedByWaf) throw error;
+    result = await requestPublicApi("/api/song/detail/", { ids: JSON.stringify(ids) }, config);
+  }
+  const songs = Array.isArray(result?.songs) ? result.songs : [];
+  const byId = new Map(songs.map((song) => [song.id, song]));
+  return ids.map((id) => byId.get(id)).filter(Boolean);
+}
+
+/**
  * 获取专辑详情（含发行公司/发售日期/专辑艺人），标签写入用。
  */
 async function getAlbumDetail(albumId, config) {
@@ -253,6 +362,22 @@ async function getAlbumDetail(albumId, config) {
     if (!error.blockedByWaf) throw error;
     return requestPublicApi(`/api/album/${albumId}`, {}, config);
   }
+}
+
+/**
+ * 获取专辑及其曲目列表（兼容 weapi 的 `{album:{songs}}` 与公开接口的 `{album, songs}`）。
+ * @returns {Promise<{album: object|null, songs: object[]}>}
+ */
+async function getAlbumSongs(albumId, config) {
+  const detail = await getAlbumDetail(albumId, config);
+  if (!detail) return { album: null, songs: [] };
+  const album = detail.album || detail;
+  const songs = Array.isArray(album?.songs)
+    ? album.songs
+    : Array.isArray(detail.songs)
+      ? detail.songs
+      : [];
+  return { album, songs };
 }
 
 /**
@@ -269,6 +394,170 @@ async function getLyric(songId, config) {
     if (!error.blockedByWaf) throw error;
     return requestPublicApi("/api/song/lyric", { id: songId, lv: 1, kv: 1, tv: 1 }, config);
   }
+}
+
+function lrcTimeToMs(stamp) {
+  const match = String(stamp).match(/^(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?$/);
+  if (!match) return null;
+  const minutes = Number(match[1]);
+  const seconds = Number(match[2]);
+  const fraction = (match[3] || "0").padEnd(3, "0").slice(0, 3);
+  return minutes * 60000 + seconds * 1000 + Number(fraction);
+}
+
+function parseLrcTags(line) {
+  const tags = [];
+  const regex = /\[(\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?)\]/g;
+  let match;
+  while ((match = regex.exec(line)) !== null) {
+    const ms = lrcTimeToMs(match[1]);
+    if (ms !== null) tags.push({ raw: match[1], ms });
+  }
+  return tags;
+}
+
+// 曲风中文名 -> 英文名映射，进程内缓存，避免每首歌重复拉取整棵分类树
+let styleTagMapCache = null;
+
+/**
+ * 获取网易云曲风分类树，构建「中文名 -> 英文名」映射（如 流行 -> Pop）。
+ * 数据来自公开接口 `POST /api/tag/list/get`。结果按进程缓存。
+ */
+async function getStyleTagMap(config) {
+  if (styleTagMapCache) return styleTagMapCache;
+  const result = await requestPublicApiPost("/api/tag/list/get", {}, config);
+  const map = new Map();
+  const walk = (list) => {
+    for (const tag of Array.isArray(list) ? list : []) {
+      const tagName = tag?.tagName;
+      if (tagName) {
+        // 曲风名本身已是英文（无中文）时保留原样，避免 R&B -> Rhythm and blues 这类冗余
+        const isLatin = !/[\u4e00-\u9fff]/.test(tagName);
+        map.set(tagName, isLatin ? tagName : tag.enName || tagName);
+      }
+      if (tag?.childrenTags) walk(tag.childrenTags);
+    }
+  };
+  walk(result?.data);
+  styleTagMapCache = map;
+  return map;
+}
+
+/** 清空曲风映射缓存（测试用）。 */
+function clearStyleTagCache() {
+  styleTagMapCache = null;
+}
+
+/** 统一曲风名拼写：`Hiphop` / `Hip Hop` / `hip hop` -> `Hip-Hop`。 */
+function normalizeGenreName(name) {
+  return String(name || "").replace(/\bhip\s?hop\b/gi, "Hip-Hop");
+}
+
+/**
+ * 把曲风名翻译成英文（映射不到时保留原名），并统一 `Hip-Hop` 等拼写。
+ */
+function translateGenreTag(title, tagMap) {
+  const name = String(title || "").trim();
+  if (!name) return name;
+  return normalizeGenreName(tagMap.has(name) ? tagMap.get(name) : name);
+}
+
+/**
+ * 拆分曲风名：复合名「父-子」（如 摇滚-流行摇滚）拆成父项与子项两段，
+ * 大项、小项当作彼此独立的标签，不保留隶属关系。
+ * 整名本身即分类树中的一个标签（如 Jump-Up）时不拆。
+ */
+function splitGenreTitle(title, tagMap) {
+  const name = String(title || "").trim();
+  if (!name) return [];
+  if (!name.includes("-") || tagMap.has(name)) return [name];
+  return name
+    .split("-")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+/**
+ * 获取歌曲曲风（流派）标签，返回英文名数组，如 `["Pop"]`、`["Rock", "Pop Rock"]`、`["Jazz"]`。
+ *
+ * 数据来自歌曲百科基础信息接口：以 `songId` 明文 POST 请求
+ * `/api/song/play/about/block/page`，其中 creativeType 为 `songTag`
+ * 的 creative 下的 `melody_style` 资源即为官方曲风；再经 `/api/tag/list/get`
+ * 的分类树把中文名映射为英文，复合名「父-子」拆成独立的多个标签
+ * （如 摇滚-流行摇滚 -> ["Rock", "Pop Rock"]）。无数据时返回 []。
+ *
+ * @param {number|string} songId
+ * @param {object} config
+ * @returns {Promise<string[]>}
+ */
+async function getSongGenreTags(songId, config) {
+  if (!songId) return [];
+  const [wikiRes, mapRes] = await Promise.allSettled([
+    requestPublicApiPost("/api/song/play/about/block/page", { songId }, config),
+    getStyleTagMap(config),
+  ]);
+  if (wikiRes.status !== "fulfilled") throw wikiRes.reason;
+  const tagMap = mapRes.status === "fulfilled" ? mapRes.value : new Map();
+
+  const result = wikiRes.value;
+  const blocks = Array.isArray(result?.data?.blocks) ? result.data.blocks : [];
+  const genres = [];
+  for (const block of blocks) {
+    const creatives = Array.isArray(block?.creatives) ? block.creatives : [];
+    for (const creative of creatives) {
+      if (creative?.creativeType !== "songTag") continue;
+      const resources = Array.isArray(creative?.resources) ? creative.resources : [];
+      for (const resource of resources) {
+        if (resource?.resourceType !== "melody_style") continue;
+        const title = resource?.uiElement?.mainTitle?.title;
+        if (!title) continue;
+        for (const segment of splitGenreTitle(title, tagMap)) {
+          const english = translateGenreTag(segment, tagMap);
+          if (english && !genres.includes(english)) genres.push(english);
+        }
+      }
+    }
+  }
+  return genres;
+}
+
+/**
+ * 合并原文与翻译歌词为双语歌词：按时间戳把翻译行插到对应原文行之后。
+ * 无原文返回 null；无翻译时原样返回原文；时间戳对不上时保留原歌词。
+ *
+ * @param {string|null} original    lrc.lyric（原文）
+ * @param {string|null} translation tlyric.lyric（翻译）
+ * @returns {string|null}
+ */
+function mergeLyric(original, translation) {
+  const base = String(original || "").replace(/\r\n?/g, "\n").trim();
+  if (!base) return null;
+  const trans = String(translation || "").replace(/\r\n?/g, "\n").trim();
+  if (!trans) return base;
+
+  const translationByTime = new Map();
+  for (const line of trans.split("\n")) {
+    const text = line.replace(/\[[^\]]*\]/g, "").trim();
+    if (!text) continue;
+    for (const tag of parseLrcTags(line)) {
+      if (!translationByTime.has(tag.ms)) translationByTime.set(tag.ms, text);
+    }
+  }
+  if (translationByTime.size === 0) return base;
+
+  const merged = [];
+  for (const line of base.split("\n")) {
+    merged.push(line);
+    const text = line.replace(/\[[^\]]*\]/g, "").trim();
+    for (const tag of parseLrcTags(line)) {
+      const translated = translationByTime.get(tag.ms);
+      if (translated && translated !== text) {
+        merged.push(`[${tag.raw}]${translated}`);
+        break;
+      }
+    }
+  }
+  return merged.join("\n");
 }
 
 /**
@@ -363,11 +652,46 @@ async function downloadFile(downloadUrl, filePath, headers = {}) {
   };
 }
 
-function buildSongOutputPath(song, config, downloadUrl, contentType) {
+function getSongArtists(song) {
+  const list = Array.isArray(song?.ar) ? song.ar : Array.isArray(song?.artists) ? song.artists : [];
+  return list.map((item) => item.name).filter(Boolean);
+}
+
+function getSongAlbumOf(song) {
+  return song?.al || song?.album || null;
+}
+
+/**
+ * 歌手文件夹名以「歌曲所在专辑的所属歌手」为准（专辑详情 artists），
+ * 拿不到专辑歌手时退回单曲歌手，最后兜底「未知歌手」。
+ */
+function resolveAlbumArtistName(song, albumInfo) {
+  const albumArtists = Array.isArray(albumInfo?.artists)
+    ? albumInfo.artists.map((item) => item.name).filter(Boolean)
+    : [];
+  if (albumArtists.length > 0) return albumArtists.join(" & ");
+  if (albumInfo?.albumArtist) return String(albumInfo.albumArtist);
+  const songArtists = getSongArtists(song);
+  if (songArtists.length > 0) return songArtists.join(" & ");
+  return "未知歌手";
+}
+
+/**
+ * 生成下载路径：<下载目录>/<专辑所属歌手>/<专辑名>/<文件名>。
+ * @param {object} song 歌曲详情
+ * @param {object} config 配置（含 downloadDir / filenamePattern）
+ * @param {string} downloadUrl 下载地址（用于推断扩展名）
+ * @param {string} contentType 响应类型（用于推断扩展名）
+ * @param {object|null} [albumInfo] 专辑详情，提供时按其中的 artists 作为歌手文件夹名
+ */
+function buildSongOutputPath(song, config, downloadUrl, contentType, albumInfo = null) {
   const name = buildSongName(song, config.filenamePattern);
   const ext = guessExtension(downloadUrl, contentType);
   const fileName = sanitizeFilename(`${name}${ext}`);
-  return path.join(config.downloadDir, fileName);
+  const album = getSongAlbumOf(song);
+  const albumFolder = sanitizeFilename(album?.name || "未知专辑");
+  const artistFolder = sanitizeFilename(resolveAlbumArtistName(song, albumInfo));
+  return path.join(config.downloadDir, artistFolder, albumFolder, fileName);
 }
 
 module.exports = {
@@ -375,18 +699,27 @@ module.exports = {
   QUALITY_ORDER,
   buildSongOutputPath,
   buildSongName,
+  clearStyleTagCache,
   downloadFile,
   fetchImage,
   getAlbumDetail,
+  getAlbumSongs,
   getLyric,
   getQualityFallbackOrder,
+  getSongGenreTags,
   getSongDetail,
+  getSongDetails,
   guessExtension,
+  mergeLyric,
   normalizeQuality,
+  parseAlbumId,
   parseCookie,
   parseSongId,
+  parseTarget,
   requestPublicApi,
   requestWeapi,
+  resolveAlbumArtistName,
   resolveDownloadUrl,
-  sanitizeFilename
+  sanitizeFilename,
+  splitTargetList
 };

@@ -59,7 +59,7 @@ function runCli(args, { input = null, home = null, inputFile = null } = {}) {
     }
     const child = spawn(process.execPath, [CLI_PATH, ...args], {
       stdio,
-      env: home ? { ...process.env, HOME: home } : process.env,
+      env: home ? { ...process.env, HOME: home, USERPROFILE: home } : process.env,
     });
     let stdout = "";
     let stderr = "";
@@ -137,6 +137,33 @@ test("无参数 + 非交互 stdin 打印帮助而非进入菜单（回归：修�
   assert.equal(code, 0);
   assert.match(stdout, /用法:/, "应输出帮助文本");
   assert.doesNotMatch(stdout, /请选择功能/, "不应进入交互式菜单");
+});
+
+test("tag 缺少 --song 时报用法并退出 1（联网前中止）", async () => {
+  const { code, stderr } = await runCli(["tag", "whatever.mp3"], { input: null });
+  assert.equal(code, 1);
+  assert.match(stderr, /--song/);
+  assert.match(stderr, /歌曲ID/);
+});
+
+test("tag 文件不存在时报错（联网前中止）", async () => {
+  const missing = path.join(os.tmpdir(), `ncmdl-missing-${process.pid}.mp3`);
+  fs.rmSync(missing, { force: true });
+  const { code, stderr } = await runCli(["tag", missing, "--song", "123456"], { input: null });
+  assert.equal(code, 1);
+  assert.match(stderr, /文件不存在/);
+});
+
+test("tag 拒绝不支持的文件类型（联网前中止）", async () => {
+  const file = path.join(os.tmpdir(), `ncmdl-tag-${process.pid}.txt`);
+  fs.writeFileSync(file, "not music");
+  try {
+    const { code, stderr } = await runCli(["tag", file, "--song", "123456"], { input: null });
+    assert.equal(code, 1);
+    assert.match(stderr, /不支持的文件类型/);
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
 });
 
 test("交互菜单在管道输入下依次消费多行选择（修复前第二个选择被吞）", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
@@ -471,6 +498,7 @@ test("TTY：菜单 2 向导粘贴 CRLF Cookie 后纯 Enter 逐项接受默认值
       { trigger: "请输入下载目录", send: "\n" },
       { trigger: "请输入默认音质", send: "\n" },
       { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请输入最大并发下载", send: "\n" },
       { trigger: "请选择功能", send: "0\n" },
     ],
     done: "再见",
@@ -617,6 +645,7 @@ test("TTY：CR 结尾粘贴后向导纯 Enter 接受默认值不挂死（回归�
       { trigger: "请输入下载目录", send: "\n" },
       { trigger: "请输入默认音质", send: "\n" },
       { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请输入最大并发下载", send: "\n" },
       { trigger: "请选择功能", send: "0\n" },
     ],
     done: "再见",
@@ -645,6 +674,7 @@ test("TTY：向导中多行粘贴被拒绝后重新提示而非静默沿用旧 C
       { trigger: "请输入下载目录", send: "\n" },
       { trigger: "请输入默认音质", send: "\n" },
       { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请输入最大并发下载", send: "\n" },
       { trigger: "请选择功能", send: "0\n" },
     ],
     done: "再见",
@@ -673,6 +703,7 @@ test("TTY：向导中分段输入间隔 0.6s（>tail 窗口）不截断，回车
       { trigger: "请输入下载目录", send: "\n" },
       { trigger: "请输入默认音质", send: "\n" },
       { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请输入最大并发下载", send: "\n" },
       { trigger: "请选择功能", send: "0\n" },
     ],
     done: "再见",
@@ -780,6 +811,7 @@ test("TTY：向导慢速多行粘贴被拒绝后重新询问，User-Agent 不被
       { trigger: "请输入下载目录", send: "\n" },
       { trigger: "请输入默认音质", send: "\n" },
       { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请输入最大并发下载", send: "\n" },
       { trigger: "请选择功能", send: "0\n" },
     ],
     done: "再见",
@@ -862,6 +894,7 @@ test("TTY：向导慢速多行粘贴（第二行间隔 1.5s）被拒绝后重新
       { trigger: "请输入下载目录", send: "\n" },
       { trigger: "请输入默认音质", send: "\n" },
       { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请输入最大并发下载", send: "\n" },
       { trigger: "请选择功能", send: "0\n" },
     ],
     done: "再见",
@@ -967,6 +1000,7 @@ test("TTY：向导中 fallback 多行粘贴第二行间隔 0.3s 被拒绝后重�
       { trigger: "请输入下载目录", send: "\n" },
       { trigger: "请输入默认音质", send: "\n" },
       { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请输入最大并发下载", send: "\n" },
       { trigger: "请选择功能", send: "0\n" },
     ],
     done: "再见",
@@ -1084,6 +1118,7 @@ test("TTY：向导默认音质改为可切换选项，输入数字即时选择",
       { trigger: "请输入下载目录", send: "\n" },
       { trigger: "请输入默认音质", send: "2" },
       { trigger: "请输入文件名模式", send: "\n" },
+      { trigger: "请输入最大并发下载", send: "\n" },
       { trigger: "请选择功能", send: "0\n" },
     ],
     done: "再见",
@@ -1100,7 +1135,7 @@ test("管道驱动：向导中 Cookie 行被正确消费，不泄漏为 User-Age
   const home = makeTempHome("MUSIC_U=old-cookie");
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
 
-  const { code, stdout } = await runCli([], { input: "2\nMUSIC_U=x\n\n\n\n\n0\n", home });
+  const { code, stdout } = await runCli([], { input: "2\nMUSIC_U=x\n\n\n\n\n\n0\n", home });
   assert.equal(code, 0);
   assert.match(stdout, /配置已保存。/);
   assert.match(stdout, /再见！/);
@@ -1115,7 +1150,7 @@ test("管道驱动：向导后残留空行不误报 EOF，队列中的 0 仍被�
   const home = makeTempHome("MUSIC_U=old-cookie");
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
 
-  const { code, stdout } = await runCli([], { input: "2\n\n\n\n\n\n0\n", home });
+  const { code, stdout } = await runCli([], { input: "2\n\n\n\n\n\n\n0\n", home });
   assert.equal(code, 0);
   assert.doesNotMatch(stdout, /输入已结束/, "队列里还有 0 时不得误报输入已结束");
   assert.match(stdout, /再见！/, "残留空行被忽略后应正常退出");
@@ -1130,4 +1165,40 @@ test("管道驱动：菜单 4 后空行被忽略，退出选项 0 正常执行�
   assert.match(stdout, /配置文件:/, "选项 4 应被执行");
   assert.doesNotMatch(stdout, /输入已结束/, "空行后不得误报输入已结束");
   assert.match(stdout, /再见！/, "退出选项 0 应被执行");
+});
+
+test("config concurrency：无参数显示当前值，带参数设置并落盘，超范围收敛", async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const show = await runCli(["config", "concurrency"], { home });
+  assert.equal(show.code, 0);
+  assert.match(show.stdout, /当前最大并发下载数: 4/);
+
+  const set = await runCli(["config", "concurrency", "8"], { home });
+  assert.equal(set.code, 0);
+  assert.match(set.stdout, /已设置为 8/);
+  let config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.concurrency, 8, "设置后的并发数应写入配置");
+
+  const clamp = await runCli(["config", "concurrency", "99"], { home });
+  assert.equal(clamp.code, 0);
+  assert.match(clamp.stdout, /已设置为 12/, "超出范围应收敛到上限");
+  config = JSON.parse(fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8"));
+  assert.equal(config.concurrency, 12);
+});
+
+test("管道驱动：向导可设置最大并发下载数并落盘", { skip: process.platform === "win32" ? WINDOWS_SKIP : false }, async (t) => {
+  const home = makeTempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const { code, stdout } = await runCli([], { input: "2\nMUSIC_U=x\n\n\n\n\n8\n0\n", home });
+  assert.equal(code, 0);
+  assert.match(stdout, /配置已保存。/);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(home, ".ncmdl", "config.json"), "utf8")
+  );
+  assert.equal(config.concurrency, 8, "向导输入的并发数应写入配置");
 });

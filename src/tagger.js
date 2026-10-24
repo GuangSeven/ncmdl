@@ -2,7 +2,7 @@
  * 音乐文件标签写入器（无第三方依赖）
  *
  * - FLAC：Vorbis Comment + PICTURE 块（参考 myuserscripts 的 MetaFlac 实现移植为 Node 版）
- * - MP3：ID3v2.3 标签（标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/歌词/封面）
+ * - MP3：ID3v2.3 标签（标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/流派/歌词/封面）
  *
  * 文本帧统一用 UTF-16（带 BOM）编码，兼容中文。
  */
@@ -191,6 +191,7 @@ function buildId3v23(tags = {}) {
   addText("TDRC", tags.year);
   addText("TPE2", tags.albumArtist);
   addText("TPUB", tags.publisher);
+  addText("TCON", tags.genre);
 
   if (tags.lyric) {
     const encoding = Buffer.from([1]);
@@ -204,7 +205,8 @@ function buildId3v23(tags = {}) {
     const coverData = Buffer.isBuffer(tags.cover.data) ? tags.cover.data : Buffer.from(tags.cover.data);
     const mime = tags.cover.mime || detectImageMime(coverData);
     const encoding = Buffer.from([1]);
-    const mimeBytes = Buffer.from(mime, "ascii");
+    // mime 必须以 0x00 结尾，否则解析器会把图片类型/描述符当成 mime 的一部分，导致图片数据错位
+    const mimeBytes = Buffer.concat([Buffer.from(mime, "ascii"), Buffer.from([0])]);
     const type = Buffer.from([3]); // cover (front)
     const descriptor = Buffer.from([0, 0]); // UTF-16 空描述符
     frames.push(
@@ -275,26 +277,33 @@ function getSongAlbum(song) {
  * 每个数据源独立容错：单个失败不阻断整体，返回 null 字段。
  * 公开接口的 song.album 已含 company/publishTime/artists，无需额外请求。
  *
- * @returns {Promise<{lyric: string|null, albumDetail: object|null, cover: Buffer|null, coverMime: string}>}
+ * @returns {Promise<{lyric: string|null, genre: string[], albumDetail: object|null, cover: Buffer|null, coverMime: string}>}
  */
-async function collectSongMetadata(song, config) {
+async function collectSongMetadata(song, config, prefetchedAlbum = null) {
   const songId = song?.id;
   const album = getSongAlbum(song);
   const albumId = album?.id;
-  const picUrl = album?.picUrl;
+  const picUrl = album?.picUrl || prefetchedAlbum?.picUrl;
   // 公开接口 song.album 自带完整专辑信息；weapi 的 al 只有基础字段，需要补请求
-  const albumHasDetail = album && (album.company || album.publishTime || Array.isArray(album.artists));
+  const albumHasDetail =
+    album && (album.company || album.publishTime || Array.isArray(album.artists));
 
-  const [lyric, albumDetail, coverRes] = await Promise.allSettled([
-    songId ? netease.getLyric(songId, config).then((r) => r?.lrc?.lyric || null) : Promise.resolve(null),
-    albumId && !albumHasDetail
-      ? netease.getAlbumDetail(albumId, config).then((r) => r?.album || r || null)
-      : Promise.resolve(albumHasDetail ? album : null),
+  const [lyric, genre, albumDetail, coverRes] = await Promise.allSettled([
+    songId
+      ? netease.getLyric(songId, config).then((r) => netease.mergeLyric(r?.lrc?.lyric, r?.tlyric?.lyric))
+      : Promise.resolve(null),
+    songId ? netease.getSongGenreTags(songId, config) : Promise.resolve([]),
+    prefetchedAlbum
+      ? Promise.resolve(prefetchedAlbum)
+      : albumId && !albumHasDetail
+        ? netease.getAlbumDetail(albumId, config).then((r) => r?.album || r || null)
+        : Promise.resolve(albumHasDetail ? album : null),
     picUrl ? netease.fetchImage(picUrl, config) : Promise.resolve(null),
   ]);
 
   return {
     lyric: lyric.status === "fulfilled" ? lyric.value : null,
+    genre: genre.status === "fulfilled" && Array.isArray(genre.value) ? genre.value : [],
     albumDetail: albumDetail.status === "fulfilled" ? albumDetail.value : null,
     cover: coverRes.status === "fulfilled" ? coverRes.value : null,
     coverMime: coverRes.status === "fulfilled" && coverRes.value ? detectImageMime(coverRes.value) : "image/jpeg",
@@ -307,7 +316,7 @@ async function collectSongMetadata(song, config) {
  *
  * @param {string} filePath
  * @param {object} song    歌曲详情对象
- * @param {{lyric: string|null, albumDetail: object|null, cover: Buffer|null, coverMime: string}} meta
+ * @param {{lyric: string|null, genre: string[], albumDetail: object|null, cover: Buffer|null, coverMime: string}} meta
  * @returns {string} 写入的标签摘要
  */
 function writeMusicTags(filePath, song, meta) {
@@ -315,24 +324,28 @@ function writeMusicTags(filePath, song, meta) {
   const artists = getSongArtists(song);
   const album = getSongAlbum(song);
   const trackNo = song?.no && song.no > 0 ? String(song.no).padStart(2, "0") : null;
-  const discNo = song?.cd ? String(song.cd) : null;
+  // weapi 详情返回 cd，公开接口返回 disc，两者取其一
+  const discRaw = song?.cd || song?.disc || null;
+  const discNo = discRaw !== null && String(discRaw).length > 0 ? String(discRaw) : null;
   const albumDetail = meta.albumDetail || album || {};
   const year = dateDesc(albumDetail.publishTime);
   const publisher = albumDetail.company || null;
   const albumArtists = Array.isArray(albumDetail.artists)
-    ? albumDetail.artists.map((a) => a.name).join(" / ")
+    ? albumDetail.artists.map((a) => a.name).join("; ")
     : null;
   const lyric = meta.lyric || null;
+  const genre = Array.isArray(meta.genre) && meta.genre.length > 0 ? meta.genre.join("; ") : null;
 
   const tags = {
     title: song?.name || null,
-    artist: artists.join(" / ") || null,
+    artist: artists.join("; ") || null,
     album: album?.name || null,
     track: trackNo,
     disc: discNo,
     year,
     albumArtist: albumArtists,
     publisher,
+    genre,
     lyric,
   };
 
@@ -348,6 +361,7 @@ function writeMusicTags(filePath, song, meta) {
     if (tags.year) flacTags.push(`DATE=${tags.year}`);
     if (tags.albumArtist) flacTags.push(`ALBUMARTIST=${tags.albumArtist}`);
     if (tags.publisher) flacTags.push(`PUBLISHER=${tags.publisher}`);
+    if (tags.genre) flacTags.push(`GENRE=${tags.genre}`);
     if (tags.lyric) flacTags.push(`LYRICS=${tags.lyric}`);
     output = tagFlac(input, { tags: flacTags }, meta.cover, meta.coverMime);
   } else if (ext === ".mp3") {
@@ -363,6 +377,8 @@ function writeMusicTags(filePath, song, meta) {
     tags.album && `专辑=${tags.album}`,
     tags.year && `日期=${tags.year}`,
     tags.track && `曲目=${tags.track}`,
+    tags.disc && `碟号=${tags.disc}`,
+    tags.genre && `流派=${tags.genre}`,
     tags.lyric && "歌词",
     meta.cover && "封面",
   ]
