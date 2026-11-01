@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("node:fs");
+const path = require("node:path");
 const { stdin, stdout, exit } = require("node:process");
 const { parseArgs } = require("node:util");
 
@@ -17,18 +18,28 @@ const {
   QUALITY_ORDER,
   buildSongOutputPath,
   downloadFile,
-  getSongDetail,
+  getAlbumDetail,
+  getAlbumSongs,
+  getSongDetails,
   normalizeQuality,
-  parseSongId,
-  resolveDownloadUrl
+  parseTarget,
+  requestPublicApi,
+  resolveDownloadUrl,
+  splitTargetList
 } = require("./netease");
 const { autoCaptureCookie } = require("./cookie");
 const { collectSongMetadata, writeMusicTags } = require("./tagger");
+const {
+  MAX_CONCURRENCY,
+  MIN_CONCURRENCY,
+  normalizeConcurrency,
+  runWithConcurrency
+} = require("./downloader");
 
 const MAIN_MENU_OPTIONS = [
   { number: "1", value: "1", label: "抓取 Cookie" },
   { number: "2", value: "2", label: "手动输入配置" },
-  { number: "3", value: "3", label: "下载歌曲" },
+  { number: "3", value: "3", label: "下载歌曲/专辑" },
   { number: "4", value: "4", label: "查看配置" },
   { number: "5", value: "5", label: "重置配置" },
   { number: "0", value: "0", label: "退出" }
@@ -73,8 +84,11 @@ function printHelp() {
 用法:
   node src/cli.js setup
   node src/cli.js cookie          ← 自动打开浏览器抓取 Cookie
-  node src/cli.js download <歌曲ID或链接>
+  node src/cli.js download <歌曲ID或链接> [更多 ID/链接...]
+  node src/cli.js download <专辑链接>
   node src/cli.js config show
+  node src/cli.js config concurrency <4-12>   ← 调整最大并发下载数
+  node src/cli.js tag <文件.mp3|.flac> --song <歌曲ID>   ← 给本地文件补写网易云标签（含封面）
 
 可用参数:
   --cookie         覆盖配置里的 Cookie
@@ -82,12 +96,33 @@ function printHelp() {
   --quality        覆盖默认音质
   --out            覆盖下载目录
   --pattern        文件名模式: artist-title | title-artist | title
+  --concurrency    同时下载数量，4-12（默认 4）
   -h, --help       显示帮助
+
+批量下载:
+  可一次传入多首歌（空格或逗号分隔）或整张专辑链接，例如
+  node src/cli.js download 123 456   789
+  node src/cli.js download https://music.163.com/#/album?id=123456
+  也可用 album:123456 形式按专辑 ID 下载
+
+本地文件补标签:
+  适用于从别处下载、或网易云拿不到播放地址的歌：按歌曲 ID 把
+  标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/流派/歌词/封面写进文件
+  node src/cli.js tag "D:\\music\\某歌.mp3" --song 123456
+  支持 .mp3（ID3v2.3）与 .flac（Vorbis Comment + PICTURE），可一次传多个文件，
+  歌词/封面等元数据只请求一次；歌曲 ID 取自歌曲页地址里的 id 参数
 
 交互模式:
   直接运行 node src/cli.js 进入交互式菜单
   菜单用 ←/→（或 ↑/↓）移动、回车确认，或直接输入数字即时进入对应选项
 `);
+}
+
+// 终端清屏：仅在真正的 TTY 上执行；管道/文件重定向时保持纯文本输出，
+// 避免向脚本结果注入转义序列
+function clearScreen() {
+  if (!stdout.isTTY) return;
+  stdout.write("\x1b[2J\x1b[3J\x1b[H");
 }
 
 function printMenu() {
@@ -122,10 +157,10 @@ async function handleMenuChoice(choice, config) {
 
     case "3":
       const configBeforeCookie = config.cookie;
-      let targetInput = await askVisible("请输入歌曲 ID 或链接");
+      let targetInput = await askVisible("请输入歌曲 ID 或链接（多个用空格/逗号分隔，支持专辑）");
       while (targetInput === PASTE_FALLOUT) {
         // 多行粘贴残留行：守卫已提示，重新询问
-        targetInput = await askVisible("请输入歌曲 ID 或链接");
+        targetInput = await askVisible("请输入歌曲 ID 或链接（多个用空格/逗号分隔，支持专辑）");
       }
       if (!targetInput) {
         stdout.write("未输入歌曲 ID 或链接，返回菜单。\n");
@@ -164,7 +199,7 @@ async function handleMenuChoice(choice, config) {
         return { continue: true, config };
       }
       try {
-        await downloadSongFlow(targetInput, config);
+        await downloadSongsFlow(targetInput, config);
       } catch (err) {
         console.error(`下载失败: ${err.message}`);
       }
@@ -222,6 +257,7 @@ async function interactiveMenu() {
     pattern: process.env.NCM_FILENAME_PATTERN || ""
   });
 
+  clearScreen();
   while (true) {
     let choice;
     if (stdin.isTTY) {
@@ -255,6 +291,8 @@ async function interactiveMenu() {
       // 直接忽略并重新显示菜单，绝不误判为"无效的选择"制造幽灵行
       continue;
     }
+    // 每次执行操作前清屏，让本次操作的输出从干净屏幕开始
+    clearScreen();
     const result = await handleMenuChoice(choice, config);
     config = result.config;
     if (result.pendingCookieRestore) {
@@ -700,7 +738,10 @@ function mergeRuntimeConfig(baseConfig, values) {
     userAgent: values.userAgent || baseConfig.userAgent || DEFAULT_USER_AGENT,
     quality: normalizeQuality(values.quality || baseConfig.quality || DEFAULT_CONFIG.quality),
     downloadDir: values.out || baseConfig.downloadDir || DEFAULT_CONFIG.downloadDir,
-    filenamePattern: values.pattern || baseConfig.filenamePattern || DEFAULT_CONFIG.filenamePattern
+    filenamePattern: values.pattern || baseConfig.filenamePattern || DEFAULT_CONFIG.filenamePattern,
+    concurrency: normalizeConcurrency(
+      values.concurrency || baseConfig.concurrency || DEFAULT_CONFIG.concurrency
+    )
   });
 }
 
@@ -767,12 +808,22 @@ async function setupWizard(currentConfig) {
       defaultValue: patternDefault
     })
   );
+  const concurrencyDefault = normalizeConcurrency(
+    currentConfig.concurrency || DEFAULT_CONFIG.concurrency
+  );
+  const concurrency = await retryField(() =>
+    askVisible(
+      `请输入最大并发下载数（${MIN_CONCURRENCY}-${MAX_CONCURRENCY}）`,
+      String(concurrencyDefault)
+    )
+  );
   const nextConfig = Object.assign({}, currentConfig, {
     cookie: cookie || currentConfig.cookie || "",
     userAgent: userAgent || currentConfig.userAgent || DEFAULT_USER_AGENT,
     downloadDir: downloadDir || currentConfig.downloadDir || DEFAULT_CONFIG.downloadDir,
     quality: normalizeQuality(quality || currentConfig.quality || DEFAULT_CONFIG.quality),
-    filenamePattern: filenamePattern || currentConfig.filenamePattern || DEFAULT_CONFIG.filenamePattern
+    filenamePattern: filenamePattern || currentConfig.filenamePattern || DEFAULT_CONFIG.filenamePattern,
+    concurrency: normalizeConcurrency(concurrency || concurrencyDefault, concurrencyDefault)
   });
   await saveConfig(nextConfig);
   stdout.write("配置已保存。\n");
@@ -786,6 +837,7 @@ function showConfig(config) {
   stdout.write(`下载目录: ${config.downloadDir || ""}\n`);
   stdout.write(`默认音质: ${config.quality || ""}\n`);
   stdout.write(`文件名模式: ${config.filenamePattern || ""}\n`);
+  stdout.write(`并发下载数: ${config.concurrency || ""}\n`);
 }
 
 async function resolveCookie(config, values) {
@@ -800,43 +852,250 @@ async function resolveCookie(config, values) {
   return askHidden("请粘贴网易云网页 Cookie（粘贴后按回车确认）");
 }
 
-async function downloadSongFlow(targetInput, config) {
-  const songId = parseSongId(targetInput);
-  if (!songId) {
-    throw new Error("请输入有效的歌曲 ID 或网易云歌曲链接。");
-  }
-  const detailRes = await getSongDetail(songId, config);
-  const song = detailRes?.songs?.[0];
-  if (!song) {
-    throw new Error(`没有找到歌曲信息，ID: ${songId}`);
-  }
-  stdout.write(`歌曲: ${song.name || "unknown"}\n`);
-  const songArtists = Array.isArray(song.ar)
+function songDisplayName(song) {
+  const artists = Array.isArray(song?.ar)
     ? song.ar
-    : Array.isArray(song.artists)
+    : Array.isArray(song?.artists)
       ? song.artists
       : [];
-  stdout.write(`歌手: ${songArtists.length > 0 ? songArtists.map((item) => item.name).join(" / ") : "unknown"}\n`);
-  const downloadRes = await resolveDownloadUrl(songId, config.quality, config);
-  const outputPath = buildSongOutputPath(song, config, downloadRes.url, "");
-  stdout.write(`音质: ${downloadRes.level}\n`);
-  stdout.write(`下载地址已获取，开始保存到: ${outputPath}\n`);
-  const fileMeta = await downloadFile(downloadRes.url, outputPath, {
+  const artist = artists.map((item) => item.name).filter(Boolean).join(" / ");
+  const title = song?.name || `ID ${song?.id ?? "unknown"}`;
+  return artist ? `${artist} - ${title}` : title;
+}
+
+/**
+ * 并发下载时同名歌曲（如同名曲目）可能落到同一路径，这里为冲突项追加 " (n)" 后缀。
+ */
+function reserveUniquePath(basePath, usedPaths) {
+  if (!usedPaths.has(basePath)) {
+    usedPaths.add(basePath);
+    return basePath;
+  }
+  const ext = path.extname(basePath);
+  const stem = ext ? basePath.slice(0, -ext.length) : basePath;
+  let index = 2;
+  let candidate = `${stem} (${index})${ext}`;
+  while (usedPaths.has(candidate)) {
+    index += 1;
+    candidate = `${stem} (${index})${ext}`;
+  }
+  usedPaths.add(candidate);
+  return candidate;
+}
+
+/**
+ * 解析歌曲所在专辑的详情（用于按专辑所属歌手建文件夹），按专辑 ID 缓存，
+ * 整张专辑下载时所有曲目只请求一次。拿不到详情时返回 null，由调用方回退单曲歌手。
+ */
+async function resolveAlbumInfo(song, config, albumCache) {
+  const album = song?.al || song?.album || null;
+  if (!album?.id) return album || null;
+  const hasDetail = album.company || album.publishTime || Array.isArray(album.artists);
+  if (hasDetail) return album;
+  if (!albumCache.has(album.id)) {
+    // 缓存 Promise：并发的同专辑歌曲只发起一次请求
+    albumCache.set(album.id, (async () => {
+      try {
+        const result = await getAlbumDetail(album.id, config);
+        const detail = result?.album || result || null;
+        return detail && detail.name ? detail : Object.assign({}, album, detail || {});
+      } catch {
+        // 专辑详情获取失败不阻断下载：歌手文件夹退回单曲歌手
+        return album;
+      }
+    })());
+  }
+  return albumCache.get(album.id);
+}
+
+/**
+ * 把用户输入（多首歌 / 整张专辑 / 混合）展开为可下载的歌曲详情列表。
+ */
+async function resolveSongsFromTargets(rawInputs, config, albumCache) {
+  const targets = [];
+  const invalid = [];
+  for (const token of splitTargetList(rawInputs)) {
+    const target = parseTarget(token);
+    if (target) {
+      targets.push(target);
+    } else {
+      invalid.push(token);
+    }
+  }
+
+  const songs = [];
+  const seen = new Set();
+  const pushSong = (song) => {
+    if (song && song.id && !seen.has(song.id)) {
+      seen.add(song.id);
+      songs.push(song);
+    }
+  };
+
+  for (const target of targets) {
+    if (target.type !== "album") continue;
+    const { album, songs: albumSongs } = await getAlbumSongs(target.id, config);
+    if (album?.id) albumCache.set(album.id, Promise.resolve(album));
+    const albumName = album?.name || `ID ${target.id}`;
+    stdout.write(`专辑《${albumName}》共 ${albumSongs.length} 首，正在获取歌曲信息...\n`);
+    const detailed = albumSongs.length > 0
+      ? await getSongDetails(albumSongs.map((song) => song.id), config)
+      : [];
+    const byId = new Map(detailed.map((song) => [song.id, song]));
+    for (const song of albumSongs) {
+      pushSong(byId.get(song.id) || song);
+    }
+  }
+
+  const songTargets = targets.filter((target) => target.type === "song");
+  if (songTargets.length > 0) {
+    const detailed = await getSongDetails(songTargets.map((target) => target.id), config);
+    const byId = new Map(detailed.map((song) => [song.id, song]));
+    for (const target of songTargets) {
+      const song = byId.get(target.id);
+      if (!song) {
+        throw new Error(`没有找到歌曲信息，ID: ${target.id}`);
+      }
+      pushSong(song);
+    }
+  }
+
+  return { songs, invalid };
+}
+
+async function downloadSong(song, config, { index, total, usedPaths, progress, albumCache }) {
+  const label = `[${index + 1}/${total}]`;
+  const display = songDisplayName(song);
+  const downloadRes = await resolveDownloadUrl(song.id, config.quality, config);
+  // 歌手文件夹以「专辑所属歌手」为准，下载前先解析专辑详情
+  const albumInfo = await resolveAlbumInfo(song, config, albumCache);
+  const outputPath = reserveUniquePath(
+    buildSongOutputPath(song, config, downloadRes.url, "", albumInfo),
+    usedPaths
+  );
+  stdout.write(`${label} 开始下载 ${display}（${downloadRes.level}）\n`);
+  await downloadFile(downloadRes.url, outputPath, {
     Cookie: config.cookie || "",
     "User-Agent": config.userAgent || DEFAULT_USER_AGENT
   });
-  stdout.write(`下载完成: ${outputPath}\n`);
-  if (fileMeta.contentType) {
-    stdout.write(`文件类型: ${fileMeta.contentType}\n`);
-  }
   // 写入音乐元数据（歌词/专辑/发售日期/封面等），失败不影响已下载文件
+  let tagSummary = "";
   try {
-    const meta = await collectSongMetadata(song, config);
-    const summary = writeMusicTags(outputPath, song, meta);
-    stdout.write(`已写入音乐标签: ${summary}\n`);
+    const meta = await collectSongMetadata(song, config, albumInfo);
+    tagSummary = writeMusicTags(outputPath, song, meta);
   } catch (tagError) {
-    stdout.write(`写入音乐标签失败（不影响已下载文件）: ${tagError.message}\n`);
+    stdout.write(`${label} 标签写入失败（不影响文件）: ${tagError.message}\n`);
   }
+  progress.completed += 1;
+  stdout.write(
+    `${label} 完成（${progress.completed}/${total}）: ${outputPath}${tagSummary ? `，标签: ${tagSummary}` : ""}\n`
+  );
+  return outputPath;
+}
+
+async function downloadSongsFlow(rawInputs, config) {
+  const albumCache = new Map();
+  const { songs, invalid } = await resolveSongsFromTargets(rawInputs, config, albumCache);
+  if (invalid.length > 0) {
+    stdout.write(`忽略无法识别的输入: ${invalid.join(" ")}\n`);
+  }
+  if (songs.length === 0) {
+    throw new Error("请输入有效的歌曲 ID、专辑或链接。");
+  }
+
+  const requested = Number.parseInt(String(config.concurrency == null ? "" : config.concurrency), 10);
+  const concurrency = normalizeConcurrency(config.concurrency);
+  if (Number.isFinite(requested) && (requested < MIN_CONCURRENCY || requested > MAX_CONCURRENCY)) {
+    stdout.write(`并发数 ${requested} 超出 ${MIN_CONCURRENCY}-${MAX_CONCURRENCY} 范围，已调整为 ${concurrency}。\n`);
+  }
+
+  const total = songs.length;
+  const usedPaths = new Set();
+  const progress = { completed: 0 };
+  stdout.write(`开始下载 ${total} 首歌曲，并发 ${Math.min(concurrency, total)}。\n`);
+
+  const results = await runWithConcurrency(songs, concurrency, (song, index) =>
+    downloadSong(song, config, { index, total, usedPaths, progress, albumCache })
+  );
+
+  const failures = [];
+  results.forEach((result, index) => {
+    if (result && result.status === "rejected") {
+      failures.push({
+        song: songs[index],
+        reason: result.reason?.message || String(result.reason)
+      });
+    }
+  });
+
+  if (failures.length === 0) {
+    stdout.write(`全部完成：成功 ${total} 首。\n`);
+  } else {
+    stdout.write(`下载结束：成功 ${total - failures.length} 首，失败 ${failures.length} 首。\n`);
+    for (const failure of failures) {
+      stdout.write(`失败: ${songDisplayName(failure.song)} - ${failure.reason}\n`);
+    }
+  }
+  return { total, failures };
+}
+
+/**
+ * 按歌曲 ID 取详情：批量接口优先，拿不到时直接请求公开接口兜底
+ *（weapi 被风控或对某些下架歌曲返回空时使用）。
+ */
+async function resolveSongById(songId, config) {
+  let songs = [];
+  try {
+    songs = await getSongDetails([songId], config);
+  } catch (error) {
+    if (!error.blockedByWaf) throw error;
+  }
+  if (Array.isArray(songs) && songs.length > 0 && songs[0]) return songs[0];
+  const result = await requestPublicApi("/api/song/detail/", { id: songId, ids: `[${songId}]` }, config);
+  const song = Array.isArray(result?.songs) && result.songs.length > 0 ? result.songs[0] : null;
+  if (!song) throw new Error(`没有找到歌曲信息，ID: ${songId}`);
+  return song;
+}
+
+/**
+ * 给本地音乐文件（外部下载/无法从网易云拿到地址的歌）写入网易云源信息标签。
+ * 元数据只拉取一次，多文件复用；单个文件失败不影响其余文件。
+ *
+ * @param {string[]} files   .mp3 / .flac 文件路径
+ * @param {string} songId    来源歌曲 ID
+ * @param {object} config
+ */
+async function tagFilesFlow(files, songId, config) {
+  const targets = (Array.isArray(files) ? files : []).filter((file) => String(file || "").trim() !== "");
+  if (targets.length === 0) {
+    throw new Error("请指定要写入标签的文件，例如: node src/cli.js tag 歌.mp3 --song 123456");
+  }
+  for (const file of targets) {
+    if (!fs.existsSync(file)) {
+      throw new Error(`文件不存在: ${file}`);
+    }
+    const ext = path.extname(file).toLowerCase();
+    if (ext !== ".mp3" && ext !== ".flac") {
+      throw new Error(`不支持的文件类型: ${file}（仅支持 .mp3 / .flac）`);
+    }
+  }
+
+  const song = await resolveSongById(songId, config);
+  stdout.write(`来源歌曲: ${songDisplayName(song)}（ID ${song.id}）\n`);
+  const meta = await collectSongMetadata(song, config);
+
+  const failures = [];
+  for (const file of targets) {
+    try {
+      const summary = writeMusicTags(file, song, meta);
+      stdout.write(`已写入: ${file}${summary ? `，标签: ${summary}` : ""}\n`);
+    } catch (error) {
+      failures.push({ file, reason: error.message });
+      stdout.write(`写入失败: ${file}（${error.message}）\n`);
+    }
+  }
+  if (failures.length > 0) process.exitCode = 1;
+  return { total: targets.length, failures };
 }
 
 async function main() {
@@ -856,7 +1115,9 @@ async function runMain() {
       "user-agent": { type: "string" },
       quality: { type: "string" },
       out: { type: "string" },
-      pattern: { type: "string" }
+      pattern: { type: "string" },
+      concurrency: { type: "string" },
+      song: { type: "string" }
     },
     allowPositionals: true,
     strict: false
@@ -865,7 +1126,7 @@ async function runMain() {
   const positionals = parsed.positionals || [];
   const command = positionals[0] || "download";
   const subcommand = positionals[1] || "";
-  const target = command === "config" ? positionals[2] || "" : positionals[1] || "";
+  const targetArgs = command === "config" ? [] : positionals.slice(1);
 
   if (parsed.values.help || command === "help" || command === "-h" || command === "--help") {
     printHelp();
@@ -874,7 +1135,7 @@ async function runMain() {
 
   // 无参数时：TTY、管道或文件重定向（脚本化驱动菜单）才进入交互菜单，
   // 否则保持旧行为打印帮助，避免在 CI / cron 等非交互环境悬空退出
-  if (positionals.length === 0 && !parsed.values.cookie && !parsed.values["user-agent"] && !parsed.values.quality && !parsed.values.out && !parsed.values.pattern) {
+  if (positionals.length === 0 && !parsed.values.cookie && !parsed.values["user-agent"] && !parsed.values.quality && !parsed.values.out && !parsed.values.pattern && !parsed.values.concurrency) {
     if (hasMenuInput()) {
       await interactiveMenu();
     } else {
@@ -889,7 +1150,8 @@ async function runMain() {
     userAgent: parsed.values["user-agent"] || process.env.NCM_USER_AGENT || "",
     quality: parsed.values.quality || process.env.NCM_QUALITY || "",
     out: parsed.values.out || process.env.NCM_DOWNLOAD_DIR || "",
-    pattern: parsed.values.pattern || process.env.NCM_FILENAME_PATTERN || ""
+    pattern: parsed.values.pattern || process.env.NCM_FILENAME_PATTERN || "",
+    concurrency: parsed.values.concurrency || process.env.NCM_CONCURRENCY || ""
   });
 
   if (command === "cookie") {
@@ -932,15 +1194,37 @@ async function runMain() {
     return;
   }
 
-  const resolvedTarget = target;
-  if (!resolvedTarget) {
+  if (command === "config" && subcommand === "concurrency") {
+    const raw = positionals[2];
+    if (raw === undefined || raw === "") {
+      stdout.write(`当前最大并发下载数: ${config.concurrency}\n`);
+      stdout.write(`用法: node src/cli.js config concurrency <${MIN_CONCURRENCY}-${MAX_CONCURRENCY}>\n`);
+      return;
+    }
+    const value = normalizeConcurrency(raw);
+    config.concurrency = value;
+    await saveConfig(config);
+    stdout.write(`最大并发下载数已设置为 ${value}。\n`);
+    return;
+  }
+
+  if (command === "tag") {
+    const songId = String(parsed.values.song || "").trim();
+    if (!/^\d+$/.test(songId)) {
+      throw new Error("tag 需要 --song <歌曲ID>，例如: node src/cli.js tag 歌.mp3 --song 123456");
+    }
+    await tagFilesFlow(targetArgs, songId, config);
+    return;
+  }
+
+  if (targetArgs.length === 0) {
     if (stdin.isTTY) {
-      const manualTarget = await askVisible("请输入歌曲 ID 或链接");
+      const manualTarget = await askVisible("请输入歌曲 ID 或链接（多个用空格/逗号分隔，支持专辑）");
       config.cookie = await resolveCookie(config, parsed.values);
       if (!config.cookie) {
         throw new Error("缺少 Cookie，无法继续。请先运行 setup 或通过 --cookie / NCM_COOKIE 提供。");
       }
-      await downloadSongFlow(manualTarget, config);
+      await downloadSongsFlow(manualTarget, config);
       return;
     }
     printHelp();
@@ -951,7 +1235,7 @@ async function runMain() {
   if (!config.cookie) {
     throw new Error("缺少 Cookie，无法继续。请先运行 setup 或通过 --cookie / NCM_COOKIE 提供。");
   }
-  await downloadSongFlow(resolvedTarget, config);
+  await downloadSongsFlow(targetArgs, config);
 }
 
 if (require.main === module) {

@@ -1,7 +1,27 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const test = require("node:test");
 
-const { dateDesc, detectImageMime, tagFlac, tagMp3 } = require("../src/tagger");
+const {
+  collectSongMetadata,
+  dateDesc,
+  detectImageMime,
+  tagFlac,
+  tagMp3,
+  writeMusicTags
+} = require("../src/tagger");
+
+function jsonResponse(payload) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    text: async () => JSON.stringify(payload),
+    headers: { get: () => "application/json" },
+  };
+}
 
 // ---------------- FLAC ----------------
 
@@ -191,6 +211,53 @@ test("tagMp3 writes USLT lyric and APIC cover", () => {
   assert.equal(frames.APIC.slice(1, 11).toString("ascii"), "image/jpeg");
 });
 
+test("tagMp3 writes TCON genre frame", () => {
+  const output = tagMp3(Buffer.from("DATA"), { title: "t", genre: "流行; 摇滚" });
+  const { frames } = parseId3v23(output);
+  assert.equal(decodeTextFrame(frames.TCON), "流行; 摇滚");
+});
+
+test("tagMp3 APIC: mime 以 0x00 结尾且图片数据完整", () => {
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.alloc(64, 0x11), Buffer.from([0xff, 0xd9])]);
+  const output = tagMp3(Buffer.from("DATA"), {
+    title: "t",
+    cover: { data: jpeg, mime: "image/jpeg" },
+  });
+  const { frames } = parseId3v23(output);
+  const apic = frames.APIC;
+  assert.ok(apic, "should contain APIC");
+  // 解析方式与播放器一致：enc(1) + mime + 0x00 + type(1) + 描述符 + 图片
+  const mimeEnd = apic.indexOf(0, 1);
+  assert.ok(mimeEnd > 1, "mime must be null terminated");
+  assert.equal(apic.slice(1, mimeEnd).toString("ascii"), "image/jpeg");
+  assert.equal(apic[mimeEnd + 1], 3, "picture type should be cover front");
+  const descStart = mimeEnd + 2;
+  assert.deepEqual(Array.from(apic.slice(descStart, descStart + 2)), [0, 0], "UTF-16 空描述符");
+  assert.ok(apic.slice(descStart + 2).equals(jpeg), "image bytes should be intact");
+});
+
+test("writeMusicTags: MP3 写入封面", () => {
+  const file = path.join(os.tmpdir(), `ncmdl-test-${process.pid}-${Date.now()}.mp3`);
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.alloc(32, 0x22), Buffer.from([0xff, 0xd9])]);
+  fs.writeFileSync(file, Buffer.from("MP3AUDIO", "ascii"));
+  try {
+    const summary = writeMusicTags(
+      file,
+      { name: "歌", ar: [{ name: "甲" }], al: { name: "专" } },
+      { lyric: null, genre: [], albumDetail: null, cover: jpeg, coverMime: "image/jpeg" }
+    );
+    const { frames } = parseId3v23(fs.readFileSync(file));
+    const apic = frames.APIC;
+    assert.ok(apic, "should contain APIC");
+    const mimeEnd = apic.indexOf(0, 1);
+    assert.equal(apic.slice(1, mimeEnd).toString("ascii"), "image/jpeg");
+    assert.ok(apic.slice(mimeEnd + 4).equals(jpeg), "image bytes should be intact");
+    assert.ok(summary.includes("封面"));
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+});
+
 test("tagMp3 skips empty optional fields", () => {
   const output = tagMp3(Buffer.from("DATA"), { title: "只有标题", track: null, disc: null, lyric: null });
   const { frames } = parseId3v23(output);
@@ -213,4 +280,99 @@ test("detectImageMime detects png and defaults jpeg", () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
   assert.equal(detectImageMime(png), "image/png");
   assert.equal(detectImageMime(Buffer.from([0xff, 0xd8, 0xff])), "image/jpeg");
+});
+
+test("collectSongMetadata: 使用预取的专辑详情而不再请求", async () => {
+  const meta = await collectSongMetadata(
+    { name: "solo", al: { id: 5, name: "专辑" } },
+    { cookie: "" },
+    { id: 5, name: "专辑", company: "厂牌", publishTime: 0 }
+  );
+  assert.equal(meta.albumDetail.company, "厂牌");
+  assert.equal(meta.lyric, null);
+  assert.equal(meta.cover, null);
+  assert.deepEqual(meta.genre, []);
+});
+
+test("collectSongMetadata: 合并翻译歌词并抓取曲风", async () => {
+  const original = global.fetch;
+  global.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes("/api/tag/list/get")) {
+      return jsonResponse({ code: 200, data: [{ tagName: "爵士", enName: "Jazz" }] });
+    }
+    if (target.includes("/api/song/play/about/block/page")) {
+      return jsonResponse({
+        code: 200,
+        data: {
+          blocks: [
+            {
+              creatives: [
+                {
+                  creativeType: "songTag",
+                  resources: [
+                    { resourceType: "melody_style", uiElement: { mainTitle: { title: "爵士" } } },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      });
+    }
+    if (target.includes("/api/song/lyric")) {
+      return jsonResponse({ lrc: { lyric: "[00:01.00]Hello" }, tlyric: { lyric: "[00:01.00]你好" } });
+    }
+    throw new Error(`unexpected request: ${target}`);
+  };
+  try {
+    const meta = await collectSongMetadata(
+      { id: 100, name: "s", al: { id: 5, name: "专辑" } },
+      { cookie: "" },
+      { id: 5, name: "专辑", company: "厂牌", publishTime: 0 }
+    );
+    assert.deepEqual(meta.genre, ["Jazz"]);
+    assert.equal(meta.lyric, "[00:01.00]Hello\n[00:01.00]你好");
+  } finally {
+    global.fetch = original;
+  }
+});
+
+test("writeMusicTags: 公开接口 shape（artists/album/disc）也写入碟号", () => {
+  const file = path.join(os.tmpdir(), `ncmdl-test-${process.pid}-${Date.now()}.mp3`);
+  fs.writeFileSync(file, Buffer.from("MP3AUDIO", "ascii"));
+  try {
+    writeMusicTags(
+      file,
+      { name: "歌", no: 3, disc: "02", artists: [{ name: "甲" }], album: { name: "专" } },
+      { lyric: null, genre: [], albumDetail: null, cover: null, coverMime: "image/jpeg" }
+    );
+    const { frames } = parseId3v23(fs.readFileSync(file));
+    assert.equal(decodeTextFrame(frames.TPOS), "02", "公开接口返回 disc 而非 cd");
+    assert.equal(decodeTextFrame(frames.TRCK), "03");
+    assert.equal(decodeTextFrame(frames.TPE1), "甲");
+    assert.equal(decodeTextFrame(frames.TALB), "专");
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+});
+
+test("writeMusicTags: FLAC 写入 GENRE 并在摘要中报告流派", () => {
+  const file = path.join(os.tmpdir(), `ncmdl-test-${process.pid}-${Date.now()}.flac`);
+  fs.writeFileSync(file, buildMinimalFlac());
+  try {
+    const summary = writeMusicTags(
+      file,
+      { name: "歌", ar: [{ name: "甲" }, { name: "乙" }], al: { name: "专" } },
+      { lyric: null, genre: ["流行", "摇滚"], albumDetail: null, cover: null, coverMime: "image/jpeg" }
+    );
+    const { blocks } = parseFlacBlocks(fs.readFileSync(file));
+    const vc = blocks.find((b) => b.type === 4);
+    const parsedTags = parseVorbisComments(vc.data);
+    assert.ok(parsedTags.includes("GENRE=流行; 摇滚"));
+    assert.ok(parsedTags.includes("ARTIST=甲; 乙"));
+    assert.ok(summary.includes("流派=流行; 摇滚"));
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
 });
