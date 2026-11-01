@@ -217,6 +217,19 @@ test("tagMp3 writes TCON genre frame", () => {
   assert.equal(decodeTextFrame(frames.TCON), "流行; 摇滚");
 });
 
+test("tagMp3 writes COMM comment frame", () => {
+  const output = tagMp3(Buffer.from("DATA"), { title: "t", comment: "专辑简介文本" });
+  const { frames } = parseId3v23(output);
+  const comm = frames.COMM;
+  assert.ok(comm, "should contain COMM");
+  // COMM = encoding(1) + language(3) + descriptor(2，UTF-16 空描述符) + text(BOM + UTF-16 + 终止符 00 00)
+  assert.equal(comm[0], 1, "UTF-16 encoding");
+  assert.equal(comm.slice(1, 4).toString("ascii"), "chi");
+  assert.deepEqual(Array.from(comm.slice(4, 6)), [0, 0], "UTF-16 空描述符");
+  assert.equal(comm.slice(8, -2).toString("utf16le"), "专辑简介文本");
+  assert.deepEqual(Array.from(comm.slice(-2)), [0, 0], "文本以 UTF-16 终止符结尾");
+});
+
 test("tagMp3 APIC: mime 以 0x00 结尾且图片数据完整", () => {
   const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.alloc(64, 0x11), Buffer.from([0xff, 0xd9])]);
   const output = tagMp3(Buffer.from("DATA"), {
@@ -259,12 +272,13 @@ test("writeMusicTags: MP3 写入封面", () => {
 });
 
 test("tagMp3 skips empty optional fields", () => {
-  const output = tagMp3(Buffer.from("DATA"), { title: "只有标题", track: null, disc: null, lyric: null });
+  const output = tagMp3(Buffer.from("DATA"), { title: "只有标题", track: null, disc: null, lyric: null, comment: null });
   const { frames } = parseId3v23(output);
   assert.ok(frames.TIT2);
   assert.equal(frames.TRCK, undefined);
   assert.equal(frames.TPOS, undefined);
   assert.equal(frames.USLT, undefined);
+  assert.equal(frames.COMM, undefined);
 });
 
 // ---------------- 工具 ----------------
@@ -338,6 +352,61 @@ test("collectSongMetadata: 合并翻译歌词并抓取曲风", async () => {
   }
 });
 
+test("collectSongMetadata: song 有详情但缺专辑简介时补请求专辑接口", async () => {
+  const requested = [];
+  const original = global.fetch;
+  global.fetch = async (url) => {
+    const target = String(url);
+    requested.push(target);
+    if (target.includes("/api/v1/album")) {
+      return jsonResponse({
+        code: 200,
+        album: { id: 5, name: "专辑", publishTime: 0, company: "厂牌", description: "简介第一行\n简介第二行" },
+      });
+    }
+    throw new Error(`unexpected request: ${target}`);
+  };
+  try {
+    // 公开接口形态：song.album 自带 company/publishTime（属“已有详情”），但 description 是空串
+    const meta = await collectSongMetadata(
+      { name: "solo", album: { id: 5, name: "专辑", company: "厂牌", publishTime: 0, description: "" } },
+      { cookie: "" }
+    );
+    assert.equal(meta.albumDetail.description, "简介第一行\n简介第二行");
+    assert.ok(requested.some((t) => t.includes("/weapi/api/v1/album")), "应补请求专辑接口");
+  } finally {
+    global.fetch = original;
+  }
+});
+
+test("collectSongMetadata: song 自带专辑简介时不再请求专辑接口", async () => {
+  const original = global.fetch;
+  let calls = 0;
+  global.fetch = async (url) => {
+    calls += 1;
+    throw new Error(`unexpected request: ${url}`);
+  };
+  try {
+    const meta = await collectSongMetadata(
+      {
+        name: "solo",
+        album: {
+          id: 5,
+          name: "专辑",
+          company: "厂牌",
+          publishTime: 0,
+          description: "自带简介",
+        },
+      },
+      { cookie: "" }
+    );
+    assert.equal(meta.albumDetail.description, "自带简介");
+    assert.equal(calls, 0, "不应发起任何网络请求");
+  } finally {
+    global.fetch = original;
+  }
+});
+
 test("writeMusicTags: 公开接口 shape（artists/album/disc）也写入碟号", () => {
   const file = path.join(os.tmpdir(), `ncmdl-test-${process.pid}-${Date.now()}.mp3`);
   fs.writeFileSync(file, Buffer.from("MP3AUDIO", "ascii"));
@@ -372,6 +441,75 @@ test("writeMusicTags: FLAC 写入 GENRE 并在摘要中报告流派", () => {
     assert.ok(parsedTags.includes("GENRE=流行; 摇滚"));
     assert.ok(parsedTags.includes("ARTIST=甲; 乙"));
     assert.ok(summary.includes("流派=流行; 摇滚"));
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+});
+
+test("writeMusicTags: 专辑简介写入备注并在摘要中报告", () => {
+  const flacFile = path.join(os.tmpdir(), `ncmdl-test-${process.pid}-${Date.now()}.flac`);
+  fs.writeFileSync(flacFile, buildMinimalFlac());
+  try {
+    const summary = writeMusicTags(
+      flacFile,
+      { name: "歌", ar: [{ name: "甲" }], al: { name: "专" } },
+      {
+        lyric: null,
+        genre: [],
+        albumDetail: { name: "专", company: "厂牌", publishTime: 100, description: "这是专辑简介\n第二行" },
+        cover: null,
+        coverMime: "image/jpeg",
+      }
+    );
+    const { blocks } = parseFlacBlocks(fs.readFileSync(flacFile));
+    const vc = blocks.find((b) => b.type === 4);
+    const parsedTags = parseVorbisComments(vc.data);
+    assert.ok(parsedTags.includes("COMMENT=这是专辑简介\n第二行"));
+    assert.ok(summary.includes("备注"));
+  } finally {
+    fs.rmSync(flacFile, { force: true });
+  }
+
+  const mp3File = path.join(os.tmpdir(), `ncmdl-test-${process.pid}-${Date.now()}.mp3`);
+  fs.writeFileSync(mp3File, Buffer.from("MP3AUDIO", "ascii"));
+  try {
+    writeMusicTags(
+      mp3File,
+      { name: "歌", ar: [{ name: "甲" }], al: { name: "专" } },
+      {
+        lyric: null,
+        genre: [],
+        albumDetail: { name: "专", company: "厂牌", publishTime: 100, description: "这是专辑简介" },
+        cover: null,
+        coverMime: "image/jpeg",
+      }
+    );
+    const { frames } = parseId3v23(fs.readFileSync(mp3File));
+    assert.ok(frames.COMM, "should contain COMM");
+    assert.equal(frames.COMM.slice(8, -2).toString("utf16le"), "这是专辑简介");
+  } finally {
+    fs.rmSync(mp3File, { force: true });
+  }
+});
+
+test("writeMusicTags: 专辑没有简介时不写备注", () => {
+  const file = path.join(os.tmpdir(), `ncmdl-test-${process.pid}-${Date.now()}.mp3`);
+  fs.writeFileSync(file, Buffer.from("MP3AUDIO", "ascii"));
+  try {
+    const summary = writeMusicTags(
+      file,
+      { name: "歌", ar: [{ name: "甲" }], al: { name: "专" } },
+      {
+        lyric: null,
+        genre: [],
+        albumDetail: { name: "专", company: "厂牌", publishTime: 0, description: "" },
+        cover: null,
+        coverMime: "image/jpeg",
+      }
+    );
+    const { frames } = parseId3v23(fs.readFileSync(file));
+    assert.equal(frames.COMM, undefined);
+    assert.ok(!summary.includes("备注"));
   } finally {
     fs.rmSync(file, { force: true });
   }

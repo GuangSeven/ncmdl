@@ -107,7 +107,7 @@ function printHelp() {
 
 本地文件补标签:
   适用于从别处下载、或网易云拿不到播放地址的歌：按歌曲 ID 把
-  标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/流派/歌词/封面写进文件
+  标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/流派/歌词/封面/备注写进文件
   node src/cli.js tag "D:\\music\\某歌.mp3" --song 123456
   支持 .mp3（ID3v2.3）与 .flac（Vorbis Comment + PICTURE），可一次传多个文件，
   歌词/封面等元数据只请求一次；歌曲 ID 取自歌曲页地址里的 id 参数
@@ -891,7 +891,9 @@ async function resolveAlbumInfo(song, config, albumCache) {
   const album = song?.al || song?.album || null;
   if (!album?.id) return album || null;
   const hasDetail = album.company || album.publishTime || Array.isArray(album.artists);
-  if (hasDetail) return album;
+  // 专辑简介一般不随歌曲详情下发（公开接口 song.album 的 description 为空串），
+  // 已有详情但缺简介时同样需要补请求，否则写不进备注(COMMENT)标签
+  if (hasDetail && album.description) return album;
   if (!albumCache.has(album.id)) {
     // 缓存 Promise：并发的同专辑歌曲只发起一次请求
     albumCache.set(album.id, (async () => {

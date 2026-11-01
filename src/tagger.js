@@ -2,7 +2,7 @@
  * 音乐文件标签写入器（无第三方依赖）
  *
  * - FLAC：Vorbis Comment + PICTURE 块（参考 myuserscripts 的 MetaFlac 实现移植为 Node 版）
- * - MP3：ID3v2.3 标签（标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/流派/歌词/封面）
+ * - MP3：ID3v2.3 标签（标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/流派/歌词/封面/备注）
  *
  * 文本帧统一用 UTF-16（带 BOM）编码，兼容中文。
  */
@@ -174,7 +174,7 @@ function detectImageMime(buffer) {
 
 /**
  * 构建完整 ID3v2.3 标签。
- * @param {object} tags  { title, artist, album, track, disc, year, albumArtist, publisher, lyric, cover:{mime,data} }
+ * @param {object} tags  { title, artist, album, track, disc, year, albumArtist, publisher, lyric, comment, cover:{mime,data} }
  */
 function buildId3v23(tags = {}) {
   const frames = [];
@@ -192,6 +192,14 @@ function buildId3v23(tags = {}) {
   addText("TPE2", tags.albumArtist);
   addText("TPUB", tags.publisher);
   addText("TCON", tags.genre);
+
+  if (tags.comment) {
+    // COMM 备注帧：encoding(1) + 语言(3) + 描述符(UTF-16 空描述符，以 00 00 结束) + 文本(以 00 00 结束)
+    const text = Buffer.concat([utf16WithBom(tags.comment), Buffer.from([0, 0])]);
+    frames.push(
+      buildId3Frame("COMM", Buffer.concat([Buffer.from([1]), Buffer.from("chi", "ascii"), Buffer.from([0, 0]), text]))
+    );
+  }
 
   if (tags.lyric) {
     const encoding = Buffer.from([1]);
@@ -275,7 +283,8 @@ function getSongAlbum(song) {
 /**
  * 收集标签所需的所有元数据（歌词 / 专辑详情 / 封面）。
  * 每个数据源独立容错：单个失败不阻断整体，返回 null 字段。
- * 公开接口的 song.album 已含 company/publishTime/artists，无需额外请求。
+ * 公开接口的 song.album 已含 company/publishTime/artists；若仍缺专辑简介（description
+ * 一般不随歌曲详情下发，公开接口只给空串），会再单独请求一次专辑接口补齐。
  *
  * @returns {Promise<{lyric: string|null, genre: string[], albumDetail: object|null, cover: Buffer|null, coverMime: string}>}
  */
@@ -287,6 +296,8 @@ async function collectSongMetadata(song, config, prefetchedAlbum = null) {
   // 公开接口 song.album 自带完整专辑信息；weapi 的 al 只有基础字段，需要补请求
   const albumHasDetail =
     album && (album.company || album.publishTime || Array.isArray(album.artists));
+  // 备注(COMMENT)用： song.album/al 里拿不到专辑简介时需要单独补请求
+  const albumNeedsDetail = !prefetchedAlbum && albumId && (!albumHasDetail || !album.description);
 
   const [lyric, genre, albumDetail, coverRes] = await Promise.allSettled([
     songId
@@ -295,8 +306,11 @@ async function collectSongMetadata(song, config, prefetchedAlbum = null) {
     songId ? netease.getSongGenreTags(songId, config) : Promise.resolve([]),
     prefetchedAlbum
       ? Promise.resolve(prefetchedAlbum)
-      : albumId && !albumHasDetail
-        ? netease.getAlbumDetail(albumId, config).then((r) => r?.album || r || null)
+      : albumNeedsDetail
+        ? netease.getAlbumDetail(albumId, config)
+            .then((r) => r?.album || r || null)
+            // 专辑接口拿不到有效详情时回退 song.album，保住已带的 company/publishTime 等字段
+            .then((detail) => (detail && detail.name ? detail : albumHasDetail ? album : null))
         : Promise.resolve(albumHasDetail ? album : null),
     picUrl ? netease.fetchImage(picUrl, config) : Promise.resolve(null),
   ]);
@@ -335,6 +349,9 @@ function writeMusicTags(filePath, song, meta) {
     : null;
   const lyric = meta.lyric || null;
   const genre = Array.isArray(meta.genre) && meta.genre.length > 0 ? meta.genre.join("; ") : null;
+  // 专辑简介 → 备注(COMMENT)。兼容 description / briefDesc / desc 三种字段名，空串视为没有简介
+  const descriptionRaw = albumDetail.description || albumDetail.briefDesc || albumDetail.desc || "";
+  const comment = typeof descriptionRaw === "string" && descriptionRaw.trim() ? descriptionRaw.trim() : null;
 
   const tags = {
     title: song?.name || null,
@@ -347,6 +364,7 @@ function writeMusicTags(filePath, song, meta) {
     publisher,
     genre,
     lyric,
+    comment,
   };
 
   const input = require("node:fs").readFileSync(filePath);
@@ -363,6 +381,7 @@ function writeMusicTags(filePath, song, meta) {
     if (tags.publisher) flacTags.push(`PUBLISHER=${tags.publisher}`);
     if (tags.genre) flacTags.push(`GENRE=${tags.genre}`);
     if (tags.lyric) flacTags.push(`LYRICS=${tags.lyric}`);
+    if (tags.comment) flacTags.push(`COMMENT=${tags.comment}`);
     output = tagFlac(input, { tags: flacTags }, meta.cover, meta.coverMime);
   } else if (ext === ".mp3") {
     output = tagMp3(input, { ...tags, cover: meta.cover ? { data: meta.cover, mime: meta.coverMime } : null });
@@ -379,6 +398,7 @@ function writeMusicTags(filePath, song, meta) {
     tags.track && `曲目=${tags.track}`,
     tags.disc && `碟号=${tags.disc}`,
     tags.genre && `流派=${tags.genre}`,
+    tags.comment && "备注",
     tags.lyric && "歌词",
     meta.cover && "封面",
   ]
