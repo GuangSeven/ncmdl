@@ -394,7 +394,11 @@ function writeMusicTags(filePath, song, meta) {
     if (tags.publisher) flacTags.push(`PUBLISHER=${tags.publisher}`);
     if (tags.genre) flacTags.push(`GENRE=${tags.genre}`);
     if (tags.lyric) flacTags.push(`LYRICS=${tags.lyric}`);
-    if (tags.comment) flacTags.push(`COMMENT=${tags.comment}`);
+    if (tags.comment) {
+      // COMMENT 为通用备注键；部分工具只读 DESCRIPTION，双写保证都能读到
+      flacTags.push(`COMMENT=${tags.comment}`);
+      flacTags.push(`DESCRIPTION=${tags.comment}`);
+    }
     output = tagFlac(input, { tags: flacTags }, meta.cover, meta.coverMime);
   } else if (ext === ".mp3") {
     output = tagMp3(input, { ...tags, cover: meta.cover ? { data: meta.cover, mime: meta.coverMime } : null });

@@ -612,6 +612,7 @@ test("writeMusicTags: 专辑简介写入备注并在摘要中报告", () => {
     const vc = blocks.find((b) => b.type === 4);
     const parsedTags = parseVorbisComments(vc.data);
     assert.ok(parsedTags.includes("COMMENT=这是专辑简介\n第二行"));
+    assert.ok(parsedTags.includes("DESCRIPTION=这是专辑简介\n第二行"), "同时写入 DESCRIPTION 兼容只读该键的工具");
     assert.ok(summary.includes("备注"));
   } finally {
     fs.rmSync(flacFile, { force: true });
