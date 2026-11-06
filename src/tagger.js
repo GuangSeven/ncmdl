@@ -2,7 +2,7 @@
  * 音乐文件标签写入器（无第三方依赖）
  *
  * - FLAC：Vorbis Comment + PICTURE 块（参考 myuserscripts 的 MetaFlac 实现移植为 Node 版）
- * - MP3：ID3v2.3 标签（标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/流派/歌词/封面/备注）
+ * - MP3：ID3v2.4 标签（标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/流派/歌词/封面/备注）
  *
  * 文本帧统一用 UTF-16（带 BOM）编码，兼容中文。
  */
@@ -139,21 +139,26 @@ function buildMetadataBlock(type, data, isLast) {
   return Buffer.concat([header, data]);
 }
 
-// ---------------- MP3 (ID3v2.3) ----------------
+// ---------------- MP3 (ID3v2.4) ----------------
 
 function utf16WithBom(str) {
   return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(String(str), "utf16le")]);
 }
 
+/** v2.4 帧大小是 synchsafe 整数（每字节 7 位；v2.3 是普通 32 位大端） */
 function buildId3Frame(id, data) {
-  const size = Buffer.alloc(4);
-  size.writeUInt32BE(data.length, 0);
-  return Buffer.concat([Buffer.from(id, "ascii"), size, Buffer.from([0, 0]), data]);
+  return Buffer.concat([Buffer.from(id, "ascii"), synchsafe(data.length), Buffer.from([0, 0]), data]);
 }
 
 function buildTextFrame(id, value) {
   if (value === undefined || value === null || String(value).length === 0) return null;
   return buildId3Frame(id, Buffer.concat([Buffer.from([1]), utf16WithBom(value)]));
+}
+
+/** TDRC 等数字字符串帧，规范要求用 ISO-8859-1（encoding 0）编码 */
+function buildAsciiTextFrame(id, value) {
+  if (value === undefined || value === null || String(value).length === 0) return null;
+  return buildId3Frame(id, Buffer.concat([Buffer.from([0]), Buffer.from(String(value), "latin1")]));
 }
 
 function synchsafe(value) {
@@ -173,13 +178,19 @@ function detectImageMime(buffer) {
 }
 
 /**
- * 构建完整 ID3v2.3 标签。
+ * 构建完整 ID3v2.4 标签。
+ * 帧大小用 synchsafe 整数（v2.4 与 v2.3 的关键结构差异）；
+ * 年份用单个 TDRC 帧（v2.4 取代 TYER/TDAT 的日期帧），直接放完整日期。
  * @param {object} tags  { title, artist, album, track, disc, year, albumArtist, publisher, lyric, comment, cover:{mime,data} }
  */
-function buildId3v23(tags = {}) {
+function buildId3v24(tags = {}) {
   const frames = [];
   const addText = (id, value) => {
     const frame = buildTextFrame(id, value);
+    if (frame) frames.push(frame);
+  };
+  const addAsciiText = (id, value) => {
+    const frame = buildAsciiTextFrame(id, value);
     if (frame) frames.push(frame);
   };
 
@@ -188,7 +199,7 @@ function buildId3v23(tags = {}) {
   addText("TALB", tags.album);
   addText("TRCK", tags.track);
   addText("TPOS", tags.disc);
-  addText("TDRC", tags.year);
+  addAsciiText("TDRC", tags.year);
   addText("TPE2", tags.albumArtist);
   addText("TPUB", tags.publisher);
   addText("TCON", tags.genre);
@@ -226,7 +237,7 @@ function buildId3v23(tags = {}) {
   const size = frames.reduce((s, f) => s + f.length, 0) + paddingBytes.length;
   const header = Buffer.concat([
     Buffer.from("ID3", "ascii"),
-    Buffer.from([3, 0]), // v2.3.0
+    Buffer.from([4, 0]), // v2.4.0
     Buffer.from([0]), // flags: 无压缩/加密/扩展头
     synchsafe(size),
   ]);
@@ -234,22 +245,24 @@ function buildId3v23(tags = {}) {
 }
 
 /**
- * 为 MP3 字节流写入 ID3v2.3 标签，返回新字节流。
+ * 为 MP3 字节流写入 ID3v2.4 标签，返回新字节流。
  * 若文件头已有 ID3 则整体替换（避免旧帧残留）。
  */
 function tagMp3(mp3, tags) {
   if (!Buffer.isBuffer(mp3)) mp3 = Buffer.from(mp3);
-  const id3 = buildId3v23(tags);
+  const id3 = buildId3v24(tags);
   if (mp3.slice(0, 3).toString("ascii") === "ID3") {
     const versionMajor = mp3[3];
     // 读取原标签大小（synchsafe），兼容 v2.3/v2.4；v2.2 头同样 10 字节
     const size =
       ((mp3[6] & 0x7f) << 21) | ((mp3[7] & 0x7f) << 14) | ((mp3[8] & 0x7f) << 7) | (mp3[9] & 0x7f);
     let tagEnd = 10 + size;
-    // v2.4 若有扩展头（flags bit6），需跳过扩展头
-    if (versionMajor === 4 && (mp3[5] & 0x40) !== 0 && tagEnd + 4 <= mp3.length) {
-      const extSize = ((mp3[tagEnd] & 0x7f) << 21) | ((mp3[tagEnd + 1] & 0x7f) << 14) | ((mp3[tagEnd + 2] & 0x7f) << 7) | (mp3[tagEnd + 3] & 0x7f);
-      tagEnd += 4 + extSize;
+    // 标签大小已包含扩展头（v2.3 §3.1 "not excluding the extended header"、
+    // v2.4 §3.1 "sum of the byte length of the extended header, the padding and
+    // the frames"），因此无需再单独跳过扩展头；
+    // 仅 v2.4 的可选脚部（footer, flags bit4）追加在标签之后，共 10 字节，需一并跳过。
+    if (versionMajor === 4 && (mp3[5] & 0x10) !== 0) {
+      tagEnd += 10;
     }
     return Buffer.concat([id3, mp3.slice(tagEnd)]);
   }

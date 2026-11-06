@@ -23,6 +23,9 @@ const QUALITY_ALIASES = {
 
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
+/** 图片下载超时（毫秒）：图片属附加产物，不能因 CDN 卡住拖住整首歌/整批下载 */
+const IMAGE_TIMEOUT_MS = 30000;
+
 function randomSecretKey(length = 16) {
   const bytes = crypto.randomBytes(length);
   let secret = "";
@@ -351,32 +354,84 @@ async function getSongDetails(songIds, config) {
   return ids.map((id) => byId.get(id)).filter(Boolean);
 }
 
+/** 专辑详情响应是否有效（weapi 为 `{album}`、公开 v1 为 `{album, songs}` 或裸 album 对象）。 */
+function hasAlbumDetail(result) {
+  return Boolean(result && (result.album || result.id || result.name));
+}
+
 /**
- * 获取专辑详情（含发行公司/发售日期/专辑艺人），标签写入用。
+ * 获取专辑详情（含发行公司/发售日期/专辑艺人，以及高清封面地址），标签/图片写入用。
+ * weapi 被风控拦截（或返回非预期 body，如 code:-462）时回退公开 v1 接口；
+ * 旧版 `/api/album` 会 HTTP 200 + body code:-462，不可靠，不再使用。
+ * 拿不到有效专辑详情时返回 null。
  */
 async function getAlbumDetail(albumId, config) {
   if (!albumId) return null;
   try {
-    return await requestWeapi("/api/v1/album", { id: albumId }, config);
+    const result = await requestWeapi("/api/v1/album", { id: albumId }, config);
+    if (hasAlbumDetail(result)) return result;
   } catch (error) {
     if (!error.blockedByWaf) throw error;
-    return requestPublicApi(`/api/album/${albumId}`, {}, config);
+  }
+  const result = await requestPublicApi(`/api/v1/album/${albumId}`, {}, config);
+  // requestPublicApi 不校验 body.code：失败时可能返回 {code:-462} 这类对象，视为无详情
+  return hasAlbumDetail(result) ? result : null;
+}
+
+/**
+ * 获取歌手详情（含高清头像/封面图地址），用于在歌手文件夹根目录保存歌手图片。
+ *
+ * 优先公开的 head 信息接口（响应体积小，返回 avatar/cover 原图地址），失败时回退
+ * 公开的歌手详情接口（img1v1Url/picUrl），最后再试 weapi。图片属于附加产物，
+ * 全部失败时返回 null 而不抛错，避免影响歌曲下载。
+ *
+ * @param {number|string} artistId
+ * @param {object} config
+ * @returns {Promise<object|null>}
+ */
+async function getArtistDetail(artistId, config) {
+  const id = Number(artistId);
+  if (!Number.isInteger(id) || id <= 0) return null;
+
+  try {
+    const result = await requestPublicApi("/api/artist/head/info/get", { id }, config);
+    const artist = result?.data?.artist;
+    if (artist && (artist.avatar || artist.cover)) return artist;
+  } catch (error) {
+    // 回退到完整歌手详情接口
+  }
+
+  try {
+    const result = await requestPublicApi(`/api/artist/${id}`, {}, config);
+    if (result?.artist) return result.artist;
+  } catch (error) {
+    // 回退到 weapi
+  }
+
+  try {
+    const result = await requestWeapi("/api/v1/artist", { id }, config);
+    return result?.artist || null;
+  } catch (error) {
+    return null;
   }
 }
 
 /**
- * 获取专辑及其曲目列表（兼容 weapi 的 `{album:{songs}}` 与公开接口的 `{album, songs}`）。
+ * 获取专辑及其曲目列表（兼容 weapi 的 `{album:{songs}}` 与公开 v1 接口的
+ * `{album, songs}`——公开 v1 的曲目位于顶层 songs，album.songs 为空数组）。
+ * 拿不到有效专辑详情时返回 `{album: null, songs: []}`。
  * @returns {Promise<{album: object|null, songs: object[]}>}
  */
 async function getAlbumSongs(albumId, config) {
   const detail = await getAlbumDetail(albumId, config);
   if (!detail) return { album: null, songs: [] };
   const album = detail.album || detail;
-  const songs = Array.isArray(album?.songs)
-    ? album.songs
-    : Array.isArray(detail.songs)
-      ? detail.songs
-      : [];
+  if (!album || typeof album !== "object" || (!album.id && !album.name)) {
+    return { album: null, songs: [] };
+  }
+  const nestedSongs = Array.isArray(album.songs) ? album.songs : [];
+  const topLevelSongs = Array.isArray(detail.songs) ? detail.songs : [];
+  const songs = nestedSongs.length > 0 ? nestedSongs : topLevelSongs;
   return { album, songs };
 }
 
@@ -561,7 +616,8 @@ function mergeLyric(original, translation) {
 }
 
 /**
- * 下载图片字节（专辑封面）。
+ * 下载图片字节（专辑封面 / 歌手图片）。
+ * 带超时：图片属附加产物，CDN 卡住时不能拖住整首歌的下载进度。
  */
 async function fetchImage(url, config = {}) {
   const userAgent = config.userAgent || DEFAULT_USER_AGENT;
@@ -569,7 +625,8 @@ async function fetchImage(url, config = {}) {
     headers: {
       Referer: "https://music.163.com/",
       "User-Agent": userAgent
-    }
+    },
+    signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS)
   });
   if (!response.ok) {
     throw new Error(`图片下载失败：HTTP ${response.status} ${response.statusText}`);
@@ -704,6 +761,7 @@ module.exports = {
   fetchImage,
   getAlbumDetail,
   getAlbumSongs,
+  getArtistDetail,
   getLyric,
   getQualityFallbackOrder,
   getSongGenreTags,

@@ -5,7 +5,9 @@ const test = require("node:test");
 const {
   buildSongOutputPath,
   clearStyleTagCache,
+  fetchImage,
   getAlbumSongs,
+  getArtistDetail,
   getSongDetails,
   getSongGenreTags,
   mergeLyric,
@@ -103,6 +105,47 @@ test("getAlbumSongs: 从专辑详情中提取曲目列表", async () => {
   );
 });
 
+test("getAlbumSongs: weapi 被风控时回退公开 v1 接口并取顶层 songs", async () => {
+  const requested = [];
+  await withMockFetch(
+    async (url) => {
+      const target = String(url);
+      requested.push(target);
+      if (target.includes("/weapi/")) {
+        // 风控表现：HTTP 200 + 空 body
+        return { ok: true, status: 200, statusText: "OK", text: async () => "", headers: { get: () => "application/json" } };
+      }
+      return jsonResponse({
+        code: 200,
+        album: { id: 9, name: "专辑", artists: [{ id: 1, name: "歌手" }], songs: [] },
+        songs: [{ id: 11 }, { id: 12 }],
+      });
+    },
+    async () => {
+      const { album, songs } = await getAlbumSongs(9, { cookie: "" });
+      assert.equal(album.name, "专辑");
+      assert.deepEqual(songs.map((song) => song.id), [11, 12], "公开 v1 的曲目在顶层 songs");
+      assert.ok(requested.some((target) => target.includes("/api/v1/album/9")));
+    }
+  );
+});
+
+test("getAlbumSongs: 公开回退返回 code:-462 时视为无专辑详情", async () => {
+  await withMockFetch(
+    async (url) => {
+      if (String(url).includes("/weapi/")) {
+        return { ok: true, status: 200, statusText: "OK", text: async () => "", headers: { get: () => "application/json" } };
+      }
+      return jsonResponse({ code: -462, message: "Cheating" });
+    },
+    async () => {
+      const { album, songs } = await getAlbumSongs(9, { cookie: "" });
+      assert.equal(album, null);
+      assert.deepEqual(songs, []);
+    }
+  );
+});
+
 test("resolveAlbumArtistName: 专辑所属歌手优先于单曲歌手", () => {
   const song = { ar: [{ name: "单曲歌手" }], al: { id: 1, name: "专辑" } };
   assert.equal(
@@ -111,6 +154,104 @@ test("resolveAlbumArtistName: 专辑所属歌手优先于单曲歌手", () => {
   );
   assert.equal(resolveAlbumArtistName(song, null), "单曲歌手");
   assert.equal(resolveAlbumArtistName({ name: "x" }, null), "未知歌手");
+});
+
+test("getArtistDetail: 优先公开 head 信息接口取歌手头像", async () => {
+  const requested = [];
+  await withMockFetch(
+    async (url) => {
+      requested.push(String(url));
+      return jsonResponse({
+        code: 200,
+        data: {
+          artist: {
+            id: 6452,
+            name: "周杰伦",
+            avatar: "http://p2.music.126.net/_ECPuM0s0qtWhkpQOSTZUg==/109951169164936940.jpg",
+            cover: "http://p2.music.126.net/NWv6PtSBkyWZzqbJVzBr7g==/109951169164936450.jpg",
+          },
+        },
+      });
+    },
+    async () => {
+      const artist = await getArtistDetail(6452, { cookie: "" });
+      assert.equal(artist.name, "周杰伦");
+      assert.match(artist.avatar, /109951169164936940\.jpg/);
+      assert.equal(requested.length, 1, "head 接口成功时不应再请求回退接口");
+      assert.match(requested[0], /\/api\/artist\/head\/info\/get\?id=6452/);
+    }
+  );
+});
+
+test("getArtistDetail: head 接口无数据时回退公开歌手详情接口", async () => {
+  const requested = [];
+  await withMockFetch(
+    async (url) => {
+      const target = String(url);
+      requested.push(target);
+      if (target.includes("/api/artist/head/info/get")) {
+        return jsonResponse({ code: 404, message: "not found" });
+      }
+      return jsonResponse({
+        artist: {
+          id: 6452,
+          name: "周杰伦",
+          img1v1Url: "https://p2.music.126.net/_ECPuM0s0qtWhkpQOSTZUg==/109951169164936940.jpg",
+          picUrl: "https://p2.music.126.net/NWv6PtSBkyWZzqbJVzBr7g==/109951169164936450.jpg",
+        },
+      });
+    },
+    async () => {
+      const artist = await getArtistDetail(6452, { cookie: "" });
+      assert.equal(artist.name, "周杰伦");
+      assert.match(artist.img1v1Url, /109951169164936940\.jpg/);
+      assert.equal(requested.length, 2);
+      assert.match(requested[1], /\/api\/artist\/6452/);
+    }
+  );
+});
+
+test("getArtistDetail: 全部接口失败或非法 id 时返回 null 不抛错", async () => {
+  await withMockFetch(
+    async () => {
+      throw new Error("network down");
+    },
+    async () => {
+      assert.equal(await getArtistDetail(6452, { cookie: "" }), null);
+    }
+  );
+  await withMockFetch(
+    async () => {
+      throw new Error("不应发起请求");
+    },
+    async () => {
+      assert.equal(await getArtistDetail(0, { cookie: "" }), null);
+      assert.equal(await getArtistDetail("abc", { cookie: "" }), null);
+    }
+  );
+});
+
+test("fetchImage: 请求带超时信号并返回 Buffer", async () => {
+  let receivedSignal = null;
+  await withMockFetch(
+    async (url, options) => {
+      receivedSignal = options?.signal;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: { get: () => "image/jpeg" },
+        arrayBuffer: async () => new Uint8Array([0xff, 0xd8, 0xff, 0xd9]).buffer,
+      };
+    },
+    async () => {
+      const result = await fetchImage("https://p1.music.126.net/a==/1.jpg", {});
+      assert.ok(Buffer.isBuffer(result));
+      assert.equal(result.length, 4);
+    }
+  );
+  assert.ok(receivedSignal, "fetchImage 应传入 AbortSignal 超时信号");
+  assert.equal(typeof receivedSignal.aborted, "boolean");
 });
 
 test("buildSongOutputPath: 按「专辑所属歌手/专辑名」建立文件夹", () => {

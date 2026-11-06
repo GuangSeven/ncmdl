@@ -28,6 +28,7 @@ const {
   splitTargetList
 } = require("./netease");
 const { autoCaptureCookie } = require("./cookie");
+const { createImageDownloader } = require("./images");
 const { collectSongMetadata, writeMusicTags } = require("./tagger");
 const {
   MAX_CONCURRENCY,
@@ -105,11 +106,16 @@ function printHelp() {
   node src/cli.js download https://music.163.com/#/album?id=123456
   也可用 album:123456 形式按专辑 ID 下载
 
+高清图片:
+  下载歌曲时自动在 歌手文件夹根目录 保存歌手图片（artist.jpg/png），
+  在 专辑文件夹根目录 保存专辑封面（cover.jpg/png）；自动使用网易云原图
+  （去掉 300x300 缩略图参数，实测常见 1000+ 像素），已存在则跳过
+
 本地文件补标签:
   适用于从别处下载、或网易云拿不到播放地址的歌：按歌曲 ID 把
   标题/歌手/专辑/曲目/碟号/年份/专辑艺人/发行公司/流派/歌词/封面/备注写进文件
   node src/cli.js tag "D:\\music\\某歌.mp3" --song 123456
-  支持 .mp3（ID3v2.3）与 .flac（Vorbis Comment + PICTURE），可一次传多个文件，
+  支持 .mp3（ID3v2.4）与 .flac（Vorbis Comment + PICTURE），可一次传多个文件，
   歌词/封面等元数据只请求一次；歌曲 ID 取自歌曲页地址里的 id 参数
 
 交互模式:
@@ -965,7 +971,41 @@ async function resolveSongsFromTargets(rawInputs, config, albumCache) {
   return { songs, invalid };
 }
 
-async function downloadSong(song, config, { index, total, usedPaths, progress, albumCache }) {
+/**
+ * 取用于歌手文件夹图片的主歌手：优先专辑所属歌手（与文件夹命名保持一致），
+ * 其次单曲歌手；返回第一个带 id 的歌手对象，供歌手详情接口拉取高清肖像。
+ */
+function resolvePrimaryArtist(song, albumInfo) {
+  const albumArtists = Array.isArray(albumInfo?.artists) ? albumInfo.artists : [];
+  const songArtists = Array.isArray(song?.ar)
+    ? song.ar
+    : Array.isArray(song?.artists)
+      ? song.artists
+      : [];
+  for (const artist of [...albumArtists, ...songArtists]) {
+    if (artist && artist.id) return artist;
+  }
+  return albumArtists[0] || songArtists[0] || null;
+}
+
+/**
+ * 输出图片下载结果。图片属于附加产物：同一目标（歌手/专辑文件夹）在整批下载中
+ * 只输出一次，失败也只提示一行，不影响歌曲本身的成功统计。
+ */
+function reportImageResult(label, kind, result) {
+  if (!result || result.reported) return;
+  if (result.status === "created") {
+    result.reported = true;
+    const dimensions =
+      result.width > 0 && result.height > 0 ? `（${result.width}×${result.height}）` : "";
+    stdout.write(`${label} ${kind}已保存${dimensions}: ${result.filePath}\n`);
+  } else if (result.status === "failed") {
+    result.reported = true;
+    stdout.write(`${label} ${kind}下载失败（不影响歌曲）: ${result.error}\n`);
+  }
+}
+
+async function downloadSong(song, config, { index, total, usedPaths, progress, albumCache, imageDownloader }) {
   const label = `[${index + 1}/${total}]`;
   const display = songDisplayName(song);
   const downloadRes = await resolveDownloadUrl(song.id, config.quality, config);
@@ -988,6 +1028,32 @@ async function downloadSong(song, config, { index, total, usedPaths, progress, a
   } catch (tagError) {
     stdout.write(`${label} 标签写入失败（不影响文件）: ${tagError.message}\n`);
   }
+  // 在歌手/专辑文件夹根目录保存高清图片：同一文件夹整批只下载一次，失败不影响歌曲
+  const albumFolder = path.dirname(outputPath);
+  const artistFolder = path.dirname(albumFolder);
+  const songArtists = Array.isArray(song?.ar)
+    ? song.ar
+    : Array.isArray(song?.artists)
+      ? song.artists
+      : [];
+  const primaryArtist = resolvePrimaryArtist(song, albumInfo);
+  reportImageResult(
+    label,
+    "歌手图片",
+    await imageDownloader.downloadArtistImage(artistFolder, {
+      artistId: primaryArtist?.id,
+      artists: [albumInfo?.artists || [], songArtists]
+    })
+  );
+  reportImageResult(
+    label,
+    "专辑封面",
+    await imageDownloader.downloadAlbumCover(albumFolder, [
+      albumInfo,
+      song?.al,
+      song?.album
+    ])
+  );
   progress.completed += 1;
   stdout.write(
     `${label} 完成（${progress.completed}/${total}）: ${outputPath}${tagSummary ? `，标签: ${tagSummary}` : ""}\n`
@@ -1014,10 +1080,11 @@ async function downloadSongsFlow(rawInputs, config) {
   const total = songs.length;
   const usedPaths = new Set();
   const progress = { completed: 0 };
+  const imageDownloader = createImageDownloader(config);
   stdout.write(`开始下载 ${total} 首歌曲，并发 ${Math.min(concurrency, total)}。\n`);
 
   const results = await runWithConcurrency(songs, concurrency, (song, index) =>
-    downloadSong(song, config, { index, total, usedPaths, progress, albumCache })
+    downloadSong(song, config, { index, total, usedPaths, progress, albumCache, imageDownloader })
   );
 
   const failures = [];
