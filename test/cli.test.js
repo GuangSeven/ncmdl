@@ -6,6 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const CLI_PATH = path.join(__dirname, "..", "src", "cli.js");
+const { buildFailureLinks } = require("../src/cli");
 const { DEFAULT_CONFIG } = require("../src/config");
 
 const WINDOWS_SKIP =
@@ -131,6 +132,19 @@ function runPty(spec, { timeoutMs = 20000 } = {}) {
     });
   });
 }
+
+test("buildFailureLinks: 失败歌曲链接汇总为一行，可直接复制重试", () => {
+  const links = buildFailureLinks([
+    { song: { id: 123, name: "a" }, reason: "x" },
+    { song: { id: 456, name: "b" }, reason: "y" }
+  ]);
+  assert.equal(
+    links,
+    "https://music.163.com/#/song?id=123 https://music.163.com/#/song?id=456"
+  );
+  assert.equal(buildFailureLinks([]), "");
+  assert.equal(buildFailureLinks([{ song: null, reason: "x" }]), "", "无歌曲 ID 时不输出空链接");
+});
 
 test("无参数 + 非交互 stdin 打印帮助而非进入菜单（回归：修复前悬空退出）", async () => {
   const { code, stdout } = await runCli([], { input: null });

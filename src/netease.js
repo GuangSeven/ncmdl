@@ -112,6 +112,11 @@ function parseSongId(input) {
   return null;
 }
 
+/** 生成歌曲网页链接（下载失败后输出可复制的重试链接用）。 */
+function buildSongPageUrl(songId) {
+  return `https://music.163.com/#/song?id=${songId}`;
+}
+
 /**
  * 解析专辑 ID：支持专辑链接、`album:123` / `album=123` 前缀，以及带 #/album 的路由。
  * 裸数字无法区分歌曲/专辑，因此不在此处理（由 parseTarget 按歌曲兜底）。
@@ -756,6 +761,7 @@ module.exports = {
   QUALITY_ORDER,
   buildSongOutputPath,
   buildSongName,
+  buildSongPageUrl,
   clearStyleTagCache,
   downloadFile,
   fetchImage,

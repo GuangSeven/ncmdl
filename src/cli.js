@@ -17,6 +17,7 @@ const {
   DEFAULT_USER_AGENT,
   QUALITY_ORDER,
   buildSongOutputPath,
+  buildSongPageUrl,
   downloadFile,
   getAlbumDetail,
   getAlbumSongs,
@@ -105,6 +106,7 @@ function printHelp() {
   node src/cli.js download 123 456   789
   node src/cli.js download https://music.163.com/#/album?id=123456
   也可用 album:123456 形式按专辑 ID 下载
+  下载结束后会汇总失败歌曲的网易云链接（一行空格分隔），可直接复制重试
 
 高清图片:
   下载歌曲时自动在 歌手文件夹根目录 保存歌手图片（artist.jpg/png），
@@ -1061,6 +1063,18 @@ async function downloadSong(song, config, { index, total, usedPaths, progress, a
   return outputPath;
 }
 
+/**
+ * 把失败歌曲的网易云链接汇总成一行（空格分隔），可直接复制粘贴到 download 命令重试。
+ */
+function buildFailureLinks(failures) {
+  const links = [];
+  for (const failure of failures) {
+    const songId = failure?.song?.id;
+    if (songId) links.push(buildSongPageUrl(songId));
+  }
+  return links.join(" ");
+}
+
 async function downloadSongsFlow(rawInputs, config) {
   const albumCache = new Map();
   const { songs, invalid } = await resolveSongsFromTargets(rawInputs, config, albumCache);
@@ -1103,6 +1117,11 @@ async function downloadSongsFlow(rawInputs, config) {
     stdout.write(`下载结束：成功 ${total - failures.length} 首，失败 ${failures.length} 首。\n`);
     for (const failure of failures) {
       stdout.write(`失败: ${songDisplayName(failure.song)} - ${failure.reason}\n`);
+    }
+    const retryLinks = buildFailureLinks(failures);
+    if (retryLinks) {
+      // 全部链接放在同一行：可直接复制后粘贴到 download 命令重试
+      stdout.write(`\n失败歌曲链接（可直接复制，粘贴到下载命令即可重试）:\n${retryLinks}\n`);
     }
   }
   return { total, failures };
@@ -1314,4 +1333,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = { main, buildFailureLinks };

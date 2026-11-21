@@ -4,6 +4,7 @@ const test = require("node:test");
 
 const {
   buildSongOutputPath,
+  buildSongPageUrl,
   clearStyleTagCache,
   fetchImage,
   getAlbumSongs,
@@ -44,6 +45,12 @@ test("parseSongId: 纯数字与歌曲链接", () => {
   assert.equal(parseSongId("https://music.163.com/#/song?id=123456"), 123456);
   assert.equal(parseSongId("https://music.163.com/song/123456"), 123456);
   assert.equal(parseSongId("not-a-song"), null);
+});
+
+test("buildSongPageUrl: 生成的链接可被 parseSongId 识别", () => {
+  const url = buildSongPageUrl(123456);
+  assert.equal(url, "https://music.163.com/#/song?id=123456");
+  assert.equal(parseSongId(url), 123456);
 });
 
 test("parseAlbumId: 专辑链接与 album: 前缀", () => {
